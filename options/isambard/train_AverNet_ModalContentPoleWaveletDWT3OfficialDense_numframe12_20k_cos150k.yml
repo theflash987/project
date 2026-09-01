@@ -1,0 +1,103 @@
+name: AverNet_ModalContentPoleWaveletDWT3OfficialDense_num_frame12_bs4_4gpu_20k_cos150k
+manual_seed: 0
+
+datasets:
+  train:
+    dataroot_lq: /projects/b6bd/AverNet/datasets/DAVIS_LQ
+    dataroot_gt: /projects/b6bd/AverNet/datasets/DAVIS
+    meta_info_file: /projects/b6bd/AverNet/datasets/DAVIS_meta_info.txt
+    filename_ext: jpg
+    filename_tmpl: 05d
+    num_frame: 12
+    gt_size: 256
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 4
+    dataset_enlarge_ratio: 1
+
+  val:
+    name: DAVIS_T6_Test_As_Val
+    dataroot_gt: /projects/b6bd/AverNet/datasets/DAVIS-GT
+    dataroot_lq: /projects/b6bd/AverNet/datasets/DAVIS_t6
+
+network_g:
+  mid_channels: 96
+  num_blocks: 7
+  max_residue_magnitude: 10
+  deform_groups: 24
+  spynet_pretrained: /projects/b6bd/AverNet/pretrained_models/flownet/spynet_sintel_final-3d2a1287.pth
+  num_poles: 16
+  pole_state_channels: 2
+  pole_mixer_channels: 32
+  pole_delta_t: 1.0
+  pole_decay_eps: !!float 1e-6
+  pole_flow_alpha: 0.01
+  pole_flow_beta: 0.5
+  pole_spatial_temperature: 0.5
+  pole_scene_reset_threshold: 0.05
+  pole_scene_reset_temperature: 0.01
+  pole_omega_max: 3.141592653589793
+  pole_separation_bandwidth: 0.01
+  pole_dead_occupancy_floor: 0.02
+  memory_fusion_init: 0.1
+  direction_attention_channels: 32
+  direction_attention_eps: !!float 1e-6
+  pre_context_branch_channels: 16
+  pre_context_channels: 32
+  context_token_channels: 64
+  modal_condition_channels: 96
+  modal_model_channels: 64
+  modal_num_heads: 4
+  modal_num_blocks: 1
+  post_context_channels: 16
+  post_context_branch_channels: 8
+  wavelet_hidden_channels: 96
+  router_channels: 32
+  inter_stage_demand_scale: 1.5
+  wavelet_infer_chunk: 4
+
+path:
+  experiments_root: /scratch/b6bd/zhuodong26.b6bd/AverNet/experiments
+
+train:
+  ema_decay: 0.999
+  optim_g:
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  scheduler:
+    periods: [150000]
+    restart_weights: [1]
+    eta_min: !!float 1e-7
+  total_iter: 20000
+  fix_flow: 1250
+  flow_lr_mul: 0.15
+  trainable_spynet_levels: [4, 5]
+  flow_teacher_schedule: [1251, 2250]
+  gradient_clip_norm: 1.0
+  lambda_rec: 1.0
+  lambda_ssim: 0.05
+  lambda_wave_res: 0.1
+  lambda_preview: 0.05
+  lambda_flow: 0.02
+  aux_loss_weights:
+    pole_separation: !!float 1e-3
+    pole_dead_occupancy: !!float 1e-2
+  energy_ema_decay: 0.99
+  energy_floor: !!float 1e-4
+  energy_weight_bounds: [0.25, 4.0]
+  charbonnier_eps: !!float 1e-6
+
+val:
+  val_freq: !!float 5000
+  metrics:
+    psnr:
+      type: psnr
+    ssim:
+      type: ssim
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 2500
+
+dist_params:
+  backend: nccl
