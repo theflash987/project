@@ -1,4 +1,4 @@
-"""Minimal distributed training services required by experiment 6220553."""
+"""Minimal distributed training services required by NoRouter-K16."""
 
 import os
 from collections import OrderedDict

@@ -15,11 +15,11 @@ module load cray-python/3.11.7
 module load cuda/12.6
 unset PYTHONHOME
 
-REPO_DIR="${SCRATCHDIR}/AverNet_BasicSR_ModalContentPoleWaveletDWT3OfficialDense/code"
+REPO_DIR="${SCRATCHDIR}/AverNet_BasicSR_ModalContentPoleWaveletDWT3NoRouterK16/code"
 BASE_DIR="${PROJECTDIR}/AverNet"
 SCRATCH_BASE="${SCRATCHDIR}/AverNet"
-CONFIG="options/isambard/train_AverNet_ModalContentPoleWaveletDWT3OfficialDense_numframe12_20k_cos150k.yml"
-EXP_NAME="smoke_ModalContentPoleWaveletOfficialDense_${SLURM_JOB_ID}"
+CONFIG="options/isambard/train_AverNet_ModalContentPoleWaveletDWT3NoRouterK16_numframe12_20k_cos150k.yml"
+EXP_NAME="smoke_ModalContentPoleWaveletNoRouterK16_${SLURM_JOB_ID}"
 PYTHON="${BASE_DIR}/conda/envs/avernet/bin/python"
 
 test -x "${PYTHON}"
@@ -31,8 +31,8 @@ export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
-export TMPDIR="/tmp/od-${SLURM_JOB_ID}"
-export PYTHONPYCACHEPREFIX="${SCRATCH_BASE}/cache/pycache_modal_officialdense"
+export TMPDIR="/tmp/nr-${SLURM_JOB_ID}"
+export PYTHONPYCACHEPREFIX="${SCRATCH_BASE}/cache/pycache_modal_norouter_k16"
 mkdir -p "${TMPDIR}" "${PYTHONPYCACHEPREFIX}" "${SCRATCH_BASE}/logs"
 cd "${REPO_DIR}"
 
@@ -87,15 +87,19 @@ def values(name):
     pattern = rf'{re.escape(name)}:\s*([+\-0-9.eE]+)'
     return [float(value) for value in re.findall(pattern, text)]
 
-router = values('router_grad_norm')
+wavelet = values('wavelet_branch_grad_norm')
 spynet = values('spynet_grad_norm')
-direction = values('stage2_direction_grad_norm')
+direction = values('stage1_direction_grad_norm')
 totals = values('l_total')
-assert len(router) >= 20 and any(value > 0 for value in router[1:])
+assert len(wavelet) >= 20 and all(value > 0 for value in wavelet)
 assert len(spynet) >= 20 and any(value > 0 for value in spynet[10:])
 assert len(direction) >= 20 and all(value > 0 for value in direction[1:])
 assert totals and all(math.isfinite(value) for value in totals)
-for name in ('l_rec', 'l_ssim', 'l_wave_res', 'l_preview', 'l_flow_teacher', 'grad_norm'):
+for name in (
+        'l_final_rec', 'l_final_ssim', 'l_base_rec', 'l_base_ssim',
+        'l_wave_res', 'l_preview', 'l_flow_teacher',
+        'base_to_final_residual_abs_mean', 'w1_local_guide_abs_mean',
+        'grad_norm'):
     assert values(name) and all(math.isfinite(value) for value in values(name)), name
 assert all(value == 0 for value in spynet[:10])
 assert all(value > 0 for value in spynet[10:])
@@ -121,9 +125,9 @@ with torch.no_grad():
 assert result['restored'].shape == long_input.shape
 assert all(torch.isfinite(value).all() for value in (
     result['restored'], result['base_restored']))
-print('DENSE_DDP_METRICS', {'router_last': router[-1], 'direction_last': direction[-1], 'spynet_last': spynet[-1], 'loss_last': totals[-1]})
-print('DENSE_LONG_SEQUENCE_PEAK_GIB', torch.cuda.max_memory_reserved() / 2**30)
-print('MODAL_CONTENT_OFFICIAL_DENSE_RESERVED_VALIDATION_OK')
+print('NOROUTER_DDP_METRICS', {'wavelet_last': wavelet[-1], 'direction_last': direction[-1], 'spynet_last': spynet[-1], 'loss_last': totals[-1]})
+print('NOROUTER_LONG_SEQUENCE_PEAK_GIB', torch.cuda.max_memory_reserved() / 2**30)
+print('MODAL_CONTENT_NOROUTER_K16_RESERVED_VALIDATION_OK')
 PY
 
-echo "MODAL_CONTENT_OFFICIAL_DENSE_SMOKE_OK ${EXP_DIR}"
+echo "MODAL_CONTENT_NOROUTER_K16_SMOKE_OK ${EXP_DIR}"

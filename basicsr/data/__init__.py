@@ -1,4 +1,4 @@
-"""The two datasets and loaders used by experiment 6220553."""
+"""The two datasets and loaders used by the NoRouter-K16 experiment."""
 
 import random
 from functools import partial

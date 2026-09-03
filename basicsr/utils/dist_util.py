@@ -1,4 +1,4 @@
-"""PyTorch distributed helpers used by experiment 6220553."""
+"""PyTorch distributed helpers used by NoRouter-K16."""
 
 import functools
 import os

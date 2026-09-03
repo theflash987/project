@@ -25,7 +25,7 @@ class BasicModule(nn.Module):
 
 
 class SpyNet(nn.Module):
-    """SpyNet architecture initialized from the 6220553 checkpoint."""
+    """SpyNet architecture initialized from the configured checkpoint."""
 
     def __init__(self, load_path):
         super().__init__()
@@ -53,6 +53,11 @@ class SpyNet(nn.Module):
 
         for level in range(len(ref)):
             upsampled_flow = F.interpolate(input=flow, scale_factor=2, mode='bilinear', align_corners=True) * 2.0
+
+            if upsampled_flow.size(2) != ref[level].size(2):
+                upsampled_flow = F.pad(input=upsampled_flow, pad=[0, 0, 0, 1], mode='replicate')
+            if upsampled_flow.size(3) != ref[level].size(3):
+                upsampled_flow = F.pad(input=upsampled_flow, pad=[0, 1, 0, 0], mode='replicate')
 
             flow = self.basic_module[level](torch.cat([
                 ref[level],

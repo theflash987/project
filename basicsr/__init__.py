@@ -1,1 +1,1 @@
-"""Minimal runtime package for experiment 6220553."""
+"""Minimal runtime package for the NoRouter-K16 experiment."""

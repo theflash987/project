@@ -1,4 +1,4 @@
-"""Logging used by experiment 6220553."""
+"""Logging used by NoRouter-K16."""
 
 import datetime
 import logging

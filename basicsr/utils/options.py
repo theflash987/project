@@ -1,4 +1,4 @@
-"""YAML and CLI parsing for the single 6220553 training configuration."""
+"""YAML and CLI parsing for the single NoRouter-K16 configuration."""
 
 import argparse
 import os

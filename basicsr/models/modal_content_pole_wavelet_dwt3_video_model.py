@@ -1,4 +1,4 @@
-"""Training wrapper for Pole-routed direct DWT-3 ModalContent restoration."""
+"""Training wrapper for isolated direct DWT-3 ModalContent restoration."""
 
 from collections import Counter, OrderedDict
 
@@ -17,7 +17,7 @@ from basicsr.utils.dist_util import get_dist_info
 
 
 class ModalContentPoleWaveletDWT3VideoModel(BaseModel):
-    """Train only reconstruction, direct wavelet, preview, flow and pole losses."""
+    """Train final/base reconstruction, wavelet, preview, flow and pole losses."""
 
     _LEVELS = ('w3', 'w2', 'w1')
 
@@ -43,6 +43,8 @@ class ModalContentPoleWaveletDWT3VideoModel(BaseModel):
 
         self.lambda_rec = float(train_opt['lambda_rec'])
         self.lambda_ssim = float(train_opt['lambda_ssim'])
+        self.lambda_base_rec = float(train_opt['lambda_base_rec'])
+        self.lambda_base_ssim = float(train_opt['lambda_base_ssim'])
         self.lambda_wave_res = float(train_opt['lambda_wave_res'])
         self.lambda_preview = float(train_opt['lambda_preview'])
         self.lambda_flow = float(train_opt['lambda_flow'])
@@ -246,7 +248,7 @@ class ModalContentPoleWaveletDWT3VideoModel(BaseModel):
         for level in self._LEVELS:
             target_residual = (
                 outputs[f'{level}_target']
-                - outputs[f'{level}_base'].detach())
+                - outputs[f'{level}_base_anchor'])
             energies.append(torch.stack([
                 band.detach().abs().mean()
                 for band in torch.chunk(target_residual, 3, dim=2)
@@ -278,7 +280,7 @@ class ModalContentPoleWaveletDWT3VideoModel(BaseModel):
         for level_index, level in enumerate(self._LEVELS):
             target = (
                 outputs[f'{level}_target']
-                - outputs[f'{level}_base'].detach())
+                - outputs[f'{level}_base_anchor'])
             prediction = outputs[f'{level}_residual']
             for orientation, (prediction_band, target_band) in enumerate(zip(
                     torch.chunk(prediction, 3, dim=2),
@@ -291,7 +293,8 @@ class ModalContentPoleWaveletDWT3VideoModel(BaseModel):
     def _gradient_norm(self, predicate):
         gradients = [
             parameter.grad.detach().float().square().sum()
-            for name, parameter in self.net_g.named_parameters()
+            for name, parameter in self.get_bare_model(
+                self.net_g).named_parameters()
             if predicate(name) and parameter.grad is not None
         ]
         if not gradients:
@@ -310,8 +313,12 @@ class ModalContentPoleWaveletDWT3VideoModel(BaseModel):
         self.output = outputs['restored']
         loss_dict = OrderedDict()
 
-        loss_rec = self._charbonnier(self.output, self.gt)
-        loss_ssim = self._ssim_loss(self.output, self.gt)
+        loss_final_rec = self._charbonnier(self.output, self.gt)
+        loss_final_ssim = self._ssim_loss(self.output, self.gt)
+        loss_base_rec = self._charbonnier(
+            outputs['base_restored'], self.gt)
+        loss_base_ssim = self._ssim_loss(
+            outputs['base_restored'], self.gt)
         energy_ema = self._update_energy_ema(outputs)
         loss_wave_res, energy_weights = self._wavelet_residual_loss(
             outputs, energy_ema)
@@ -321,14 +328,18 @@ class ModalContentPoleWaveletDWT3VideoModel(BaseModel):
         flow_weight = self._ramp(
             current_iter, self.flow_teacher_schedule, self.lambda_flow)
         total = (
-            self.lambda_rec * loss_rec
-            + self.lambda_ssim * loss_ssim
+            self.lambda_rec * loss_final_rec
+            + self.lambda_ssim * loss_final_ssim
+            + self.lambda_base_rec * loss_base_rec
+            + self.lambda_base_ssim * loss_base_ssim
             + self.lambda_wave_res * loss_wave_res
             + self.lambda_preview * loss_preview
             + flow_weight * flow_loss)
         loss_dict.update({
-            'l_rec': loss_rec,
-            'l_ssim': loss_ssim,
+            'l_final_rec': loss_final_rec,
+            'l_final_ssim': loss_final_ssim,
+            'l_base_rec': loss_base_rec,
+            'l_base_ssim': loss_base_ssim,
             'l_wave_res': loss_wave_res,
             'l_preview': loss_preview,
             'l_flow_teacher': flow_loss,
@@ -350,6 +361,9 @@ class ModalContentPoleWaveletDWT3VideoModel(BaseModel):
             'wave_res_w3_abs_mean': outputs['w3_residual'].detach().abs().mean(),
             'wave_res_w2_abs_mean': outputs['w2_residual'].detach().abs().mean(),
             'wave_res_w1_abs_mean': outputs['w1_residual'].detach().abs().mean(),
+            'base_to_final_residual_abs_mean': (
+                outputs['restored'].detach()
+                - outputs['base_restored'].detach()).abs().mean(),
             'teacher_loss_fraction': (
                 flow_weight * flow_loss.detach()
                 / total.detach().abs().clamp_min(1e-12)),
@@ -364,18 +378,21 @@ class ModalContentPoleWaveletDWT3VideoModel(BaseModel):
         spynet_grad_norm = self._gradient_norm(
             lambda name: 'spynet.basic_module.4.' in name
             or 'spynet.basic_module.5.' in name)
-        router_grad_norm = self._gradient_norm(
-            lambda name: 'pole_wavelet_router' in name)
+        wavelet_branch_grad_norm = self._gradient_norm(
+            lambda name: name.startswith((
+                'post_degradation_context.',
+                'w1_local_guide.',
+                'wavelet_experts.')))
         direction_grad_norm = self._gradient_norm(
-            lambda name: 'direction_attention.stage_2.' in name)
+            lambda name: 'direction_attention.stage_1.' in name)
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.net_g.parameters(), self.gradient_clip_norm)
         self.optimizer_g.step()
         loss_dict.update({
             'grad_norm': grad_norm.detach(),
             'spynet_grad_norm': spynet_grad_norm.detach(),
-            'router_grad_norm': router_grad_norm.detach(),
-            'stage2_direction_grad_norm': direction_grad_norm.detach(),
+            'wavelet_branch_grad_norm': wavelet_branch_grad_norm.detach(),
+            'stage1_direction_grad_norm': direction_grad_norm.detach(),
         })
         loss_dict['cuda_peak_allocated_gib'] = self.output.new_tensor(
             torch.cuda.max_memory_allocated(self.device) / 2**30)
@@ -391,7 +408,12 @@ class ModalContentPoleWaveletDWT3VideoModel(BaseModel):
             outputs = network(self.lq)
         self.output = outputs['restored']
         self.base_output = outputs['base_restored']
-        self.validation_router_stats = outputs['log_vars']
+        self.validation_stats = {
+            'w1_local_guide_abs_mean': (
+                outputs['log_vars']['w1_local_guide_abs_mean']),
+            'base_to_final_residual_abs_mean': (
+                self.output - self.base_output).abs().mean(),
+        }
 
     def get_current_visuals(self):
         return OrderedDict(
@@ -431,8 +453,12 @@ class ModalContentPoleWaveletDWT3VideoModel(BaseModel):
         num_folders = len(dataset)
         num_pad = (world_size - num_folders % world_size) % world_size
         pbar = tqdm(total=num_folders, unit='folder') if rank == 0 else None
-        router_sums = {}
-        router_count = 0
+        diagnostic_names = (
+            'base_to_final_residual_abs_mean',
+            'w1_local_guide_abs_mean',
+        )
+        diagnostic_sums = {name: 0.0 for name in diagnostic_names}
+        diagnostic_count = 0
         for data_index in range(rank, num_folders + num_pad, world_size):
             index = min(data_index, num_folders - 1)
             val_data = dataset[index]
@@ -455,12 +481,9 @@ class ModalContentPoleWaveletDWT3VideoModel(BaseModel):
                         for metric_index, name in enumerate(metric_names):
                             result_sets[kind][folder][frame, metric_index] = (
                                 metrics[name](prediction, gt).cpu().item())
-                for name, value in self.validation_router_stats.items():
-                    if name.startswith('router_'):
-                        router_sums[name] = (
-                            router_sums.get(name, 0.0)
-                            + float(value.detach().cpu()))
-                router_count += 1
+                for name, value in self.validation_stats.items():
+                    diagnostic_sums[name] += float(value.detach().cpu())
+                diagnostic_count += 1
             del self.lq, self.output, self.base_output
             del self.gt
             torch.cuda.empty_cache()
@@ -472,6 +495,12 @@ class ModalContentPoleWaveletDWT3VideoModel(BaseModel):
         for kind in result_sets.values():
             for tensor in kind.values():
                 dist.reduce(tensor, 0)
+        diagnostic_totals = torch.tensor(
+            [*(diagnostic_sums[name] for name in diagnostic_names),
+             diagnostic_count],
+            dtype=torch.float64,
+            device=self.device)
+        dist.reduce(diagnostic_totals, 0)
         dist.barrier()
         if rank == 0:
             log_lines = [f'Validation {dataset_name} @ {current_iter}']
@@ -487,13 +516,13 @@ class ModalContentPoleWaveletDWT3VideoModel(BaseModel):
                             f'metrics/{dataset_name}/{kind}_{name}',
                             value,
                             current_iter)
-            if router_count:
-                for name in sorted(router_sums):
-                    value = router_sums[name] / router_count
-                    log_lines.append(f'\t{name}: {value:.6f}')
-                    if tb_logger:
-                        tb_logger.add_scalar(
-                            f'router/{name}', value, current_iter)
+            count = diagnostic_totals[-1].item()
+            for index, name in enumerate(diagnostic_names):
+                value = diagnostic_totals[index].item() / count
+                log_lines.append(f'\t{name}: {value:.6f}')
+                if tb_logger:
+                    tb_logger.add_scalar(
+                        f'diagnostics/{name}', value, current_iter)
             get_root_logger().info('\n'.join(log_lines))
 
     def save(self, epoch, current_iter):

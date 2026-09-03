@@ -1,4 +1,4 @@
-"""Fresh 20k distributed training entry point for experiment 6220553."""
+"""Fresh 20k distributed training entry point for NoRouter-K16."""
 
 import datetime
 import logging

@@ -1,6 +1,4 @@
-"""Official dense propagation with detached pole evidence for direct DWT-3."""
-
-import math
+"""Official dense propagation with an isolated direct DWT-3 residual branch."""
 
 import torch
 from torch import nn
@@ -20,11 +18,9 @@ from basicsr.archs.official_dense_components import (
 from basicsr.archs.modal_content_dwt3_components import (
     CompactPostDegradationContext,
     FixedStablePoles,
-    InterStageDWTReanchor,
     ModalConditionedAlignment,
     ModalConditionProjector,
     ModalContentPoleHistoryCell,
-    ModalResidueRefiner,
     Stage1PreviewHead,
     VideoPreContext,
 )
@@ -66,210 +62,48 @@ class DilatedResidualBlock(nn.Module):
         return value + self.body(value)
 
 
-class BlurPoolDownsample(nn.Module):
-    """Fixed anti-aliasing blur followed by learned stride-two projection."""
+class W1LocalGuide(nn.Module):
+    """Frame-local, orientation-specific guide for the W1 expert."""
 
-    def __init__(self, channels):
+    def __init__(self, post_context_channels=16, guide_channels=32):
         super().__init__()
-        kernel = torch.tensor([1., 4., 6., 4., 1.])
-        kernel = (kernel[:, None] * kernel[None, :]) / 256.0
-        self.register_buffer(
-            'blur_kernel',
-            kernel.view(1, 1, 5, 5).repeat(channels, 1, 1, 1))
-        self.channels = int(channels)
-        self.projection = nn.Conv2d(channels, channels, 3, 2, 1)
-
-    def forward(self, value):
-        value = F.conv2d(
-            value,
-            self.blur_kernel.to(dtype=value.dtype),
-            padding=2,
-            groups=self.channels)
-        return self.projection(value)
-
-
-class PoleWaveletRouter(nn.Module):
-    """Route detached pole evidence mixed by trainable direction weights."""
-
-    _LEVELS = ('w3', 'w2', 'w1')
-    _ORIENTATIONS = ('lh', 'hl', 'hh')
-
-    def __init__(
-            self,
-            num_poles=16,
-            state_channels=2,
-            context_channels=16,
-            router_channels=32,
-            eps=1e-6):
-        super().__init__()
-        self.num_poles = int(num_poles)
-        self.state_channels = int(state_channels)
-        self.router_channels = int(router_channels)
-        self.eps = float(eps)
-        self.state_projection = nn.Conv2d(
-            2 * state_channels, 2 * router_channels, 1)
-        orientation_evidence_channels = 4 * 3 + context_channels
-        self.query = nn.ModuleDict({
-            level: nn.Sequential(
-                nn.Conv2d(
-                    orientation_evidence_channels,
-                    router_channels,
-                    3,
-                    1,
-                    1),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(router_channels, router_channels, 1))
-            for level in self._LEVELS
-        })
-        self.w3_adapter = BlurPoolDownsample(router_channels)
-        self.w1_band_guide = nn.Sequential(
+        self.encoder = nn.Sequential(
             nn.Conv2d(
-                orientation_evidence_channels,
-                router_channels,
+                4 * 3 + post_context_channels,
+                guide_channels,
                 3,
                 1,
                 1),
             nn.SiLU(inplace=True),
-            ResidualUnit(router_channels))
-        self.w1_fusion = nn.Sequential(
-            nn.Conv2d(2 * router_channels, router_channels, 3, 1, 1),
-            nn.SiLU(inplace=True),
-            ResidualUnit(router_channels))
+            ResidualUnit(guide_channels))
 
-    @staticmethod
-    def _orientation_evidence(base, lq, context):
-        evidence = []
-        for base_band, lq_band in zip(
-                torch.chunk(base, 3, dim=2),
-                torch.chunk(lq, 3, dim=2)):
-            difference = base_band - lq_band
-            evidence.append(torch.cat([
-                base_band,
-                lq_band,
+    def forward(self, base_band, lq_band, post_context):
+        batch, frames = base_band.shape[:2]
+        contexts = []
+        for base_rgb, lq_rgb in zip(
+                torch.chunk(base_band, 3, dim=2),
+                torch.chunk(lq_band, 3, dim=2)):
+            difference = base_rgb - lq_rgb
+            evidence = torch.cat([
+                base_rgb,
+                lq_rgb,
                 difference,
                 difference.abs(),
-                context,
-            ], dim=2))
-        return evidence
-
-    @staticmethod
-    def _flatten_video(value):
-        batch, frames, channels, height, width = value.shape
-        return value.reshape(batch * frames, channels, height, width)
-
-    def _stack_states(self, router_frames, device, dtype):
-        # Detach raw evidence at collection, not this weighted mixture: its
-        # only upstream trainable path is the isolated direction scorer.
-        real = torch.stack([
-            frame['real'] for frame in router_frames
-        ], dim=1).to(device=device, dtype=dtype)
-        imag = torch.stack([
-            frame['imag'] for frame in router_frames
-        ], dim=1).to(device=device, dtype=dtype)
-        reliability = torch.stack([
-            frame['reliability'] for frame in router_frames
-        ], dim=1).to(device=device, dtype=dtype)
-        batch, frames, poles, channels, height, width = real.shape
-        projected = self.state_projection(torch.cat([
-            real,
-            imag,
-        ], dim=3).reshape(
-            batch * frames * poles,
-            2 * channels,
-            height,
-            width)).reshape(
+                post_context,
+            ], dim=2)
+            height, width = evidence.shape[-2:]
+            contexts.append(self.encoder(evidence.reshape(
                 batch * frames,
-                poles,
-                2 * self.router_channels,
+                evidence.shape[2],
                 height,
-                width)
-        keys, values = torch.chunk(projected, 2, dim=2)
-        reliability = reliability.reshape(
-            batch * frames, poles, height, width)
-        return keys, values, reliability, (height, width)
-
-    def forward(
-            self,
-            level,
-            base_band,
-            lq_band,
-            post_context,
-            router_frames):
-        evidence = self._orientation_evidence(
-            base_band, lq_band, post_context)
-        flat_evidence = [self._flatten_video(value) for value in evidence]
-        keys, values, reliability, master_size = self._stack_states(
-            router_frames,
-            base_band.device,
-            base_band.dtype)
-        queries = []
-        for value in flat_evidence:
-            query = self.query[level](value)
-            if query.shape[-2:] != master_size:
-                query = F.interpolate(
-                    query,
-                    size=master_size,
-                    mode='bilinear',
-                    align_corners=False)
-            queries.append(query)
-        query = torch.stack(queries, dim=1)
-        logits = torch.einsum(
-            'bodhw,bkdhw->bokhw', query, keys) / math.sqrt(
-                self.router_channels)
-        logits = logits + torch.log(
-            reliability.clamp_min(self.eps)).unsqueeze(1)
-        alpha = torch.softmax(logits, dim=2)
-        context = torch.einsum(
-            'bokhw,bkhw,bkdhw->bodhw',
-            alpha,
-            reliability,
-            values)
-
-        batch, frames = base_band.shape[:2]
-        native_size = base_band.shape[-2:]
-        adapted = []
-        for orientation in range(3):
-            value = context[:, orientation]
-            if level == 'w3':
-                value = self.w3_adapter(value)
-            elif level == 'w1':
-                value = F.interpolate(
-                    value,
-                    size=native_size,
-                    mode='bilinear',
-                    align_corners=False)
-                guide = self.w1_band_guide(flat_evidence[orientation])
-                value = self.w1_fusion(torch.cat([value, guide], dim=1))
-            adapted.append(value)
-        adapted = torch.stack(adapted, dim=1).reshape(
+                width)))
+        return torch.stack(contexts, dim=1).reshape(
             batch,
             frames,
             3,
-            self.router_channels,
-            native_size[0],
-            native_size[1])
-
-        stats = {}
-        flat_alpha = alpha.detach()
-        top_indices = flat_alpha.argmax(dim=2)
-        for orientation, name in enumerate(self._ORIENTATIONS):
-            orientation_alpha = flat_alpha[:, orientation]
-            entropy = -(
-                orientation_alpha
-                * torch.log(orientation_alpha.clamp_min(self.eps))
-            ).sum(dim=1).mean()
-            histogram = F.one_hot(
-                top_indices[:, orientation],
-                num_classes=self.num_poles).float().mean(dim=(0, 1, 2))
-            effective = 1.0 / histogram.square().sum().clamp_min(self.eps)
-            stats.update({
-                f'router_{level}_{name}_entropy': entropy,
-                f'router_{level}_{name}_top1_occupancy': histogram.max(),
-                f'router_{level}_{name}_effective_modes': effective,
-                f'router_{level}_{name}_context_abs_mean': (
-                    adapted[:, :, orientation].detach().abs().mean()),
-            })
-        return adapted, stats, alpha
+            -1,
+            base_band.shape[-2],
+            base_band.shape[-1])
 
 
 class DirectWaveletExpert(nn.Module):
@@ -279,7 +113,7 @@ class DirectWaveletExpert(nn.Module):
             self,
             input_channels=52,
             hidden_channels=96,
-            context_channels=32,
+            spatial_context_channels=None,
             token_channels=64,
             dilations=(1, 1)):
         super().__init__()
@@ -294,27 +128,40 @@ class DirectWaveletExpert(nn.Module):
         self.token_film = nn.Linear(
             2 * token_channels,
             3 * 2 * hidden_channels)
-        self.spatial_film = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(context_channels, hidden_channels, 3, 1, 1),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(hidden_channels, 2 * hidden_channels, 1))
-            for _ in range(3)
-        ])
+        self.spatial_film = None
+        if spatial_context_channels is not None:
+            self.spatial_film = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv2d(
+                        spatial_context_channels,
+                        hidden_channels,
+                        3,
+                        1,
+                        1),
+                    nn.SiLU(inplace=True),
+                    nn.Conv2d(hidden_channels, 2 * hidden_channels, 1))
+                for _ in range(3)
+            ])
         self.residual_heads = nn.ModuleList([
             nn.Conv2d(hidden_channels, 3, 3, 1, 1)
             for _ in range(3)
         ])
         nn.init.constant_(self.token_film.weight, 0.0)
         nn.init.constant_(self.token_film.bias, 0.0)
-        for film in self.spatial_film:
-            nn.init.normal_(film[-1].weight, mean=0.0, std=1e-3)
-            nn.init.constant_(film[-1].bias, 0.0)
+        if self.spatial_film is not None:
+            for film in self.spatial_film:
+                nn.init.normal_(film[-1].weight, mean=0.0, std=1e-3)
+                nn.init.constant_(film[-1].bias, 0.0)
         for head in self.residual_heads:
             nn.init.constant_(head.weight, 0.0)
             nn.init.constant_(head.bias, 0.0)
 
-    def forward(self, evidence, pole_context, frame_token, clip_token):
+    def forward(
+            self,
+            evidence,
+            frame_token,
+            clip_token,
+            spatial_context=None):
         batch, frames, _, height, width = evidence.shape
         feature = self.blocks(self.input_encoder(evidence.reshape(
             batch * frames,
@@ -332,25 +179,31 @@ class DirectWaveletExpert(nn.Module):
             self.hidden_channels,
             1,
             1)
-        contexts = pole_context.reshape(
-            batch * frames,
-            3,
-            pole_context.shape[3],
-            height,
-            width)
+        contexts = None
+        if spatial_context is not None:
+            contexts = spatial_context.reshape(
+                batch * frames,
+                3,
+                spatial_context.shape[3],
+                height,
+                width)
         residuals = []
         for orientation in range(3):
-            spatial_gamma, spatial_beta = torch.chunk(
-                self.spatial_film[orientation](
-                    contexts[:, orientation]),
-                2,
-                dim=1)
             token_gamma = token_film[:, orientation, 0]
             token_beta = token_film[:, orientation, 1]
-            conditioned = (
-                feature * (1.0 + token_gamma + spatial_gamma)
-                + token_beta
-                + spatial_beta)
+            conditioned = feature * (1.0 + token_gamma) + token_beta
+            if self.spatial_film is not None:
+                if spatial_context is None:
+                    raise ValueError('W1 spatial context is required.')
+                spatial_gamma, spatial_beta = torch.chunk(
+                    self.spatial_film[orientation](
+                        contexts[:, orientation]),
+                    2,
+                    dim=1)
+                conditioned = (
+                    conditioned
+                    + feature * spatial_gamma
+                    + spatial_beta)
             residuals.append(
                 self.residual_heads[orientation](conditioned))
         return torch.cat(residuals, dim=1).reshape(
@@ -358,14 +211,14 @@ class DirectWaveletExpert(nn.Module):
 
 
 class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
-    """Generator trained by job 6220553."""
+    """NoRouter-K16 generator with four dense propagation branches."""
 
     _BRANCHES = ('backward_1', 'forward_1', 'backward_2', 'forward_2')
     _STAGE_BRANCHES = (
         ('backward_1', 'forward_1'),
         ('backward_2', 'forward_2'),
     )
-    _FUSION_KEYS = ('stage_1', 'stage_2')
+    _FUSION_KEYS = ('stage_1',)
 
     def __init__(
             self,
@@ -382,11 +235,8 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             pole_flow_alpha,
             pole_flow_beta,
             pole_spatial_temperature,
-            pole_scene_reset_threshold,
-            pole_scene_reset_temperature,
             pole_omega_max,
             pole_separation_bandwidth,
-            pole_dead_occupancy_floor,
             memory_fusion_init,
             direction_attention_channels,
             direction_attention_eps,
@@ -394,14 +244,10 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             pre_context_channels,
             context_token_channels,
             modal_condition_channels,
-            modal_model_channels,
-            modal_num_heads,
-            modal_num_blocks,
             post_context_channels,
             post_context_branch_channels,
             wavelet_hidden_channels,
-            router_channels,
-            inter_stage_demand_scale,
+            w1_guide_channels,
             wavelet_infer_chunk):
         super().__init__()
         self.mid_channels = int(mid_channels)
@@ -437,11 +283,9 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
         self.conv_last = nn.Conv2d(64, 3, 3, 1, 1)
         self.lrelu = nn.LeakyReLU(negative_slope=0.1, inplace=True)
         self._attention_debug_stats = {}
-        self._last_direction_weights = {}
         self.num_poles = int(num_poles)
         self.pole_state_channels = int(pole_state_channels)
         self.deform_groups = int(deform_groups)
-        self.pole_dead_occupancy_floor = float(pole_dead_occupancy_floor)
         self.wavelet_infer_chunk = int(wavelet_infer_chunk)
         for module in self.spynet.basic_module[:4]:
             module.requires_grad_(False)
@@ -466,24 +310,12 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             for branch in self._BRANCHES
         })
         self.stage1_preview = Stage1PreviewHead(channels=mid_channels)
-        self.inter_stage_reanchor = InterStageDWTReanchor(
-            channels=mid_channels,
-            detail_channels=9,
-            demand_scale=inter_stage_demand_scale)
         self.shared_poles = FixedStablePoles(
             num_poles=num_poles,
             delta_t=pole_delta_t,
             decay_eps=pole_decay_eps,
             omega_max=pole_omega_max,
             separation_bandwidth=pole_separation_bandwidth)
-        self.modal_refiner = ModalResidueRefiner(
-            num_poles=num_poles,
-            state_channels=pole_state_channels,
-            context_channels=context_token_channels,
-            model_channels=modal_model_channels,
-            num_heads=modal_num_heads,
-            num_blocks=modal_num_blocks,
-            num_branches=len(self._BRANCHES))
         self.history_cells = nn.ModuleDict({
             branch: ModalContentPoleHistoryCell(
                 channels=mid_channels,
@@ -494,9 +326,7 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
                 decay_eps=pole_decay_eps,
                 flow_alpha=pole_flow_alpha,
                 flow_beta=pole_flow_beta,
-                spatial_temperature=pole_spatial_temperature,
-                scene_reset_threshold=pole_scene_reset_threshold,
-                scene_reset_temperature=pole_scene_reset_temperature)
+                spatial_temperature=pole_spatial_temperature)
             for branch in self._BRANCHES
         })
         self.memory_fusion = nn.ParameterDict({
@@ -508,30 +338,27 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             channels=post_context_channels,
             branch_channels=post_context_branch_channels,
             flow_eps=pole_decay_eps)
-        self.pole_wavelet_router = PoleWaveletRouter(
-            num_poles=num_poles,
-            state_channels=pole_state_channels,
-            context_channels=post_context_channels,
-            router_channels=router_channels,
-            eps=pole_decay_eps)
+        self.w1_local_guide = W1LocalGuide(
+            post_context_channels=post_context_channels,
+            guide_channels=w1_guide_channels)
         expert_input_channels = 4 * 9 + post_context_channels
         self.wavelet_experts = nn.ModuleDict({
             'w3': DirectWaveletExpert(
                 input_channels=expert_input_channels,
                 hidden_channels=wavelet_hidden_channels,
-                context_channels=router_channels,
+                spatial_context_channels=None,
                 token_channels=context_token_channels,
                 dilations=(1, 2)),
             'w2': DirectWaveletExpert(
                 input_channels=expert_input_channels,
                 hidden_channels=wavelet_hidden_channels,
-                context_channels=router_channels,
+                spatial_context_channels=None,
                 token_channels=context_token_channels,
                 dilations=(1, 1, 1, 1)),
             'w1': DirectWaveletExpert(
                 input_channels=expert_input_channels,
                 hidden_channels=wavelet_hidden_channels,
-                context_channels=router_channels,
+                spatial_context_channels=w1_guide_channels,
                 token_channels=context_token_channels,
                 dilations=(1, 1)),
         })
@@ -546,12 +373,9 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
 
         self._branch_debug_stats = {}
         self._branch_occupancies = {}
-        self._stage2_router_branches = {}
-        self._last_pole_router_frames = None
         self._last_pole_sequence = None
         self._last_frame_tokens = None
         self._last_clip_token = None
-        self._last_summary_tokens = None
         self._last_stage1_preview = None
         self._context_flows_forward = None
         self._context_flows_backward = None
@@ -608,7 +432,6 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             backward_trust,
             forward_trust):
         fused_features = []
-        direction_weights = []
         frame_stats = []
         attention = self.direction_attention[stage_key]
         for frame in range(len(reference_features)):
@@ -617,14 +440,12 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             forward = forward_features[frame]
             backward_reliability = backward_trust[frame]
             forward_reliability = forward_trust[frame]
-            attention_inputs = (
-                reference, backward, forward,
-                backward_reliability, forward_reliability)
-            if stage_key == 'stage_2':
-                # Dense RGB reconstruction bypasses this fusion. Train its
-                # direction scorer through the router, never through recurrence.
-                attention_inputs = tuple(value.detach() for value in attention_inputs)
-            output = attention(*attention_inputs)
+            output = attention(
+                reference,
+                backward,
+                forward,
+                backward_reliability,
+                forward_reliability)
             weights = output['weights']
             frame_stats.append({
                 'current_weight_mean': weights[:, 0].detach().mean(),
@@ -642,12 +463,8 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
                 'forward_reliability_mean': (
                     forward_reliability.detach().mean()),
             })
-            fused = output['fused']
-            saved_weights = weights if stage_key == 'stage_2' else weights.detach()
-            fused_features.append(fused)
-            direction_weights.append(saved_weights)
+            fused_features.append(output['fused'])
         self._attention_debug_stats[stage_key] = self._mean_stats(frame_stats)
-        self._last_direction_weights[stage_key] = direction_weights
         return fused_features
 
     @staticmethod
@@ -663,26 +480,16 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
                 'phi_imag')
         }
 
-    @staticmethod
-    def _detach_router_state(state):
-        return {
-            name: value.detach()
-            for name, value in state.items()
-        }
-
     def _propagate_branch(
             self,
             branch,
             spatial_features,
             completed_branches,
-            stage_condition,
             modal_alignment,
-            inter_stage_demands,
             flows_forward,
             flows_backward,
             pole_sequence,
-            frame_tokens,
-            summary_tokens):
+            frame_tokens):
         direction = branch.split('_', 1)[0]
         if direction == 'backward':
             flows = flows_backward
@@ -702,21 +509,12 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
         state = None
         branch_features = []
         branch_trust = []
-        router_states = []
         frame_stats = []
         frame_occupancies = []
         branch_index = self._BRANCHES.index(branch)
         for index, frame in enumerate(frame_indices):
             current = spatial_features[frame]
             alignment_condition = modal_alignment[frame]
-            demand = (
-                None
-                if inter_stage_demands is None
-                else inter_stage_demands[frame])
-            condition = (
-                None
-                if stage_condition is None
-                else stage_condition[frame])
             previous = propagated.clone()
             if index > 0:
                 pair_index = flow_indices[index]
@@ -740,7 +538,7 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
                 deform_aligned = propagated
 
             current_poles = self._frame_poles(pole_sequence, frame)
-            memory, state, propagation_trust = self.history_cells[branch](
+            memory, state, alignment_gate = self.history_cells[branch](
                 current,
                 deform_aligned,
                 spatial_aligned,
@@ -748,32 +546,18 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
                 flow,
                 reverse_flow,
                 current_poles,
-                frame_tokens[:, frame],
-                summary_tokens,
-                self.modal_refiner,
-                branch_index)
+                frame_tokens[:, frame])
             temporal_context = (
-                propagation_trust * deform_aligned
+                alignment_gate * deform_aligned
                 + torch.tanh(self.memory_fusion[branch]) * memory)
-            reanchor_delta = temporal_context.new_zeros(())
-            if demand is not None:
-                reanchor_delta = self.inter_stage_reanchor(
-                    temporal_context, condition, demand)
-                temporal_context = temporal_context + reanchor_delta
             stats = dict(self.history_cells[branch].last_debug_stats)
             stats.update({
                 'modal_alignment_abs_mean': (
                     alignment_condition.detach().abs().mean()),
-                'inter_stage_reanchor_abs_mean': (
-                    reanchor_delta.detach().abs().mean()),
             })
             frame_stats.append(stats)
             frame_occupancies.append(
                 self.history_cells[branch].last_occupancy)
-            if branch.endswith('_2'):
-                router_states.append(self._detach_router_state(
-                    self.history_cells[branch].last_router_state))
-
             backbone_inputs = [current]
             # Same order as official AverNet: current, all earlier passes,
             # then this branch's aligned recurrent/pole context. No detach.
@@ -784,79 +568,25 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             propagated = temporal_context + self.backbone[branch](
                 torch.cat(backbone_inputs, dim=1))
             branch_features.append(propagated)
-            branch_trust.append(propagation_trust)
+            branch_trust.append(alignment_gate)
 
         if direction == 'backward':
             branch_features = branch_features[::-1]
             branch_trust = branch_trust[::-1]
-            router_states = router_states[::-1]
         self._branch_debug_stats[branch] = self._mean_stats(frame_stats)
         self._branch_occupancies[branch] = torch.stack(
             frame_occupancies, dim=1).mean(dim=(0, 1))
-        if branch.endswith('_2'):
-            self._stage2_router_branches[branch] = router_states
         return branch_features, branch_trust
 
-    def _build_inter_stage_demand(
+    def _build_stage1_preview(
             self, lqs, spatial_features, stage1_features):
         previews = []
-        demands = []
         for frame, (spatial_feature, stage1_feature) in enumerate(zip(
                 spatial_features, stage1_features)):
-            lq_frame = lqs[:, frame:frame + 1]
             preview = self.stage1_preview(
-                lq_frame[:, 0], spatial_feature, stage1_feature).unsqueeze(1)
-            lq_pyramid = dwt3_bior44(lq_frame)
-            preview_pyramid = dwt3_bior44(preview)
-            signed_details = {
-                level: preview_pyramid[level][:, 0] - lq_pyramid[level][:, 0]
-                for level in ('w3', 'w2', 'w1')
-            }
-            demand = self.inter_stage_reanchor.encode_demand(
-                signed_details, stage1_feature.shape[-2:])
-            previews.append(preview[:, 0])
-            demands.append(demand)
-        return torch.stack(previews, dim=1), demands
-
-    def _combine_stage2_router_states(self):
-        backward = self._stage2_router_branches['backward_2']
-        forward = self._stage2_router_branches['forward_2']
-        weights = self._last_direction_weights['stage_2']
-        combined = []
-        for backward_frame, forward_frame, frame_weights in zip(
-                backward, forward, weights):
-            weight_backward = frame_weights[:, 1:2]
-            weight_forward = frame_weights[:, 2:3]
-            state_weight_backward = weight_backward.unsqueeze(1)
-            state_weight_forward = weight_forward.unsqueeze(1)
-            real = (
-                state_weight_backward * backward_frame['real']
-                + state_weight_forward * forward_frame['real'])
-            imag = (
-                state_weight_backward * backward_frame['imag']
-                + state_weight_forward * forward_frame['imag'])
-            reliability_backward = (
-                weight_backward
-                * backward_frame['confidence']
-                * backward_frame['history_strength'])
-            reliability_forward = (
-                weight_forward
-                * forward_frame['confidence']
-                * forward_frame['history_strength'])
-            reliability = (
-                reliability_backward
-                * backward_frame['read_gate']
-                + reliability_forward
-                * forward_frame['read_gate']).clamp(0.0, 1.0)
-            combined.append({
-                # States/gates are already detached when collected. Keep only
-                # the Stage-2 direction scorer's gradient through this mixture.
-                'real': real,
-                'imag': imag,
-                'reliability': reliability,
-            })
-        self._last_pole_router_frames = combined
-        self._stage2_router_branches = {}
+                lqs[:, frame], spatial_feature, stage1_feature)
+            previews.append(preview)
+        return torch.stack(previews, dim=1)
 
     def _collect_temporal_stats(self, reference):
         averaged = self._mean_stats(list(self._branch_debug_stats.values()))
@@ -884,8 +614,6 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             'pole_mixer_occupancy_mean': occupancy.mean(),
             'pole_mixer_occupancy_min': occupancy.min(),
             'pole_mixer_content_adaptation_enabled': reference.new_tensor(0.0),
-            'stage2_pole_states_detached': reference.new_tensor(1.0),
-            'stage2_router_direction_weights_trainable': reference.new_tensor(1.0),
         })
         stats.update({
             f'pole_mixer_{name}': value
@@ -897,8 +625,6 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
         self._branch_debug_stats = {}
         self._branch_occupancies = {}
         self._attention_debug_stats = {}
-        self._last_direction_weights = {}
-        self._stage2_router_branches = {}
         batch, frames, channels, height, width = lqs.shape
         lqs_downsample = F.interpolate(
             lqs.reshape(-1, channels, height, width),
@@ -924,7 +650,6 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
         pre_context = self.pre_context(lqs_downsample)
         frame_tokens = pre_context['frame_tokens']
         clip_token = pre_context['clip_token']
-        summary_tokens = pre_context['summary_tokens']
         modal_alignment_tensor = self.modal_condition_projector(
             pre_context['spatial'], frame_tokens, clip_token)
         modal_alignment = [
@@ -934,62 +659,37 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
         self._last_pole_sequence = pole_sequence
         self._last_frame_tokens = frame_tokens
         self._last_clip_token = clip_token
-        self._last_summary_tokens = summary_tokens
 
         branch_features = {}
         branch_trust = {}
-        fused_stages = {}
-        inter_stage_demands = None
         for stage_index, stage_branches in enumerate(
                 self._STAGE_BRANCHES, start=1):
-            stage_condition = (
-                None if stage_index == 1 else fused_stages['stage_1'])
             for branch in stage_branches:
                 branch_features[branch], branch_trust[branch] = (
                     self._propagate_branch(
                         branch,
                         features['spatial'],
                         branch_features,
-                        stage_condition,
                         modal_alignment,
-                        inter_stage_demands,
                         flows_forward,
                         flows_backward,
                         pole_sequence,
-                        frame_tokens,
-                        summary_tokens))
-            stage_key = f'stage_{stage_index}'
-            reference_features = (
-                features['spatial']
-                if stage_index == 1
-                else fused_stages['stage_1'])
-            backward_branch, forward_branch = stage_branches
-            fused_stages[stage_key] = self._fuse_bidirectional_stage(
-                stage_key,
-                reference_features,
-                branch_features[backward_branch],
-                branch_features[forward_branch],
-                branch_trust[backward_branch],
-                branch_trust[forward_branch])
+                        frame_tokens))
             if stage_index == 1:
-                self._last_stage1_preview, inter_stage_demands = (
-                    self._build_inter_stage_demand(
-                        lqs,
-                        features['spatial'],
-                        fused_stages['stage_1']))
-        self._combine_stage2_router_states()
+                backward_branch, forward_branch = stage_branches
+                stage1_features = self._fuse_bidirectional_stage(
+                    'stage_1',
+                    features['spatial'],
+                    branch_features[backward_branch],
+                    branch_features[forward_branch],
+                    branch_trust[backward_branch],
+                    branch_trust[forward_branch])
+                self._last_stage1_preview = self._build_stage1_preview(
+                    lqs,
+                    features['spatial'],
+                    stage1_features)
 
-        occupancy = torch.stack(
-            list(self._branch_occupancies.values()), dim=0).mean(dim=0)
-        pole_dead = F.relu(
-            1.0
-            - occupancy / occupancy.new_tensor(
-                self.pole_dead_occupancy_floor)).square().mean()
-        self.last_aux_losses = {
-            **pole_sequence['aux_losses'],
-            'pole_dead_occupancy': pole_dead,
-        }
-        features.update(fused_stages)
+        self.last_aux_losses = dict(pole_sequence['aux_losses'])
         features.update(branch_features)
         restored = self.upsample(lqs, features)
         self.last_temporal_stats = self._collect_temporal_stats(restored)
@@ -1000,9 +700,6 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
         return (
             self._last_frame_tokens[:, frame_start:end],
             self._last_clip_token)
-
-    def _router_frames_for_chunk(self, frame_start, frames):
-        return self._last_pole_router_frames[frame_start:frame_start + frames]
 
     def _flows_for_chunk(self, frame_start, frames):
         end = frame_start + frames - 1
@@ -1024,9 +721,13 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
     def _wavelet_refine_chunk(
             self, lqs, base_restored, gt=None, frame_start=0):
         lq_pyramid = dwt3_bior44(lqs)
-        base_pyramid = dwt3_bior44(base_restored)
+        base_live = dwt3_bior44(base_restored)
+        base_anchor = {
+            name: value.detach()
+            for name, value in base_live.items()
+        }
         spatial_sizes = {
-            level: base_pyramid[level].shape[-2:]
+            level: base_live[level].shape[-2:]
             for level in ('w3', 'w2', 'w1')
         }
         flows_forward, flows_backward = self._flows_for_chunk(
@@ -1038,36 +739,35 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             flows_forward=flows_forward,
             flows_backward=flows_backward)
         frame_tokens, clip_token = self._tokens_for_chunk(lqs, frame_start)
-        router_frames = self._router_frames_for_chunk(
-            frame_start, lqs.shape[1])
+        frame_tokens = frame_tokens.detach()
+        clip_token = clip_token.detach()
 
         predictions = {}
         residuals = {}
-        router_stats = {}
-        router_alphas = {}
+        wavelet_stats = {}
         for level in ('w3', 'w2', 'w1'):
-            pole_context, stats, alpha = self.pole_wavelet_router(
-                level,
-                base_pyramid[level],
-                lq_pyramid[level],
-                degradation['contexts'][level],
-                router_frames)
             evidence = self._expert_evidence(
-                base_pyramid[level],
+                base_anchor[level],
                 lq_pyramid[level],
                 degradation['contexts'][level])
+            spatial_context = None
+            if level == 'w1':
+                spatial_context = self.w1_local_guide(
+                    base_anchor[level],
+                    lq_pyramid[level],
+                    degradation['contexts'][level])
+                wavelet_stats['w1_local_guide_abs_mean'] = (
+                    spatial_context.detach().abs().mean())
             residual = self.wavelet_experts[level](
                 evidence,
-                pole_context,
                 frame_tokens,
-                clip_token)
+                clip_token,
+                spatial_context=spatial_context)
             residuals[level] = residual
-            predictions[level] = base_pyramid[level] + residual
-            router_stats.update(stats)
-            router_alphas[level] = alpha
+            predictions[level] = base_live[level] + residual
 
         a2_pred = idwt_level_bior44(
-            base_pyramid['a3'], predictions['w3'])
+            base_live['a3'], predictions['w3'])
         a1_pred = idwt_level_bior44(a2_pred, predictions['w2'])
         restored = idwt_level_bior44(a1_pred, predictions['w1'])
         outputs = {
@@ -1076,12 +776,11 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             'a2_pred': a2_pred,
             'a1_pred': a1_pred,
             'aux_losses': dict(self.last_aux_losses),
-            'router_stats': router_stats,
-            'router_alphas': router_alphas,
+            'wavelet_stats': wavelet_stats,
         }
         for level in ('w3', 'w2', 'w1'):
             outputs[f'{level}_pred'] = predictions[level]
-            outputs[f'{level}_base'] = base_pyramid[level]
+            outputs[f'{level}_base_anchor'] = base_anchor[level]
             outputs[f'{level}_residual'] = residuals[level]
         if gt is not None:
             target_pyramid = dwt3_bior44(gt)
@@ -1109,7 +808,7 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             local_end = local_start + end - start
             restored_chunks.append(
                 chunk['restored'][:, local_start:local_end])
-            stat_chunks.append(chunk['router_stats'])
+            stat_chunks.append(chunk['wavelet_stats'])
         stats = {
             name: torch.stack([chunk[name] for chunk in stat_chunks]).mean()
             for name in stat_chunks[0]
@@ -1117,7 +816,7 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
         return {
             'restored': torch.cat(restored_chunks, dim=1),
             'base_restored': base_restored,
-            'router_stats': stats,
+            'wavelet_stats': stats,
         }
 
     def forward(self, lqs, gt=None):
@@ -1136,8 +835,7 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             ..., :original_size[0], :original_size[1]]
         self.last_wavelet_stats = {
             'dwt3_direct_residual_enabled': restored.new_tensor(1.0),
-            'dwt3_pole_router_detached': restored.new_tensor(0.0),
-            **wavelet_outputs['router_stats'],
+            **wavelet_outputs['wavelet_stats'],
         }
         outputs = dict(wavelet_outputs)
         outputs.update({

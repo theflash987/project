@@ -1,4 +1,4 @@
-name: AverNet_ModalContentPoleWaveletDWT3OfficialDense_num_frame12_bs4_4gpu_20k_cos150k
+name: AverNet_ModalContentPoleWaveletDWT3NoRouterK16_num_frame12_bs4_4gpu_20k_cos150k
 manual_seed: 0
 
 datasets:
@@ -33,11 +33,8 @@ network_g:
   pole_flow_alpha: 0.01
   pole_flow_beta: 0.5
   pole_spatial_temperature: 0.5
-  pole_scene_reset_threshold: 0.05
-  pole_scene_reset_temperature: 0.01
   pole_omega_max: 3.141592653589793
   pole_separation_bandwidth: 0.01
-  pole_dead_occupancy_floor: 0.02
   memory_fusion_init: 0.1
   direction_attention_channels: 32
   direction_attention_eps: !!float 1e-6
@@ -45,14 +42,10 @@ network_g:
   pre_context_channels: 32
   context_token_channels: 64
   modal_condition_channels: 96
-  modal_model_channels: 64
-  modal_num_heads: 4
-  modal_num_blocks: 1
   post_context_channels: 16
   post_context_branch_channels: 8
   wavelet_hidden_channels: 96
-  router_channels: 32
-  inter_stage_demand_scale: 1.5
+  w1_guide_channels: 32
   wavelet_infer_chunk: 4
 
 path:
@@ -76,12 +69,13 @@ train:
   gradient_clip_norm: 1.0
   lambda_rec: 1.0
   lambda_ssim: 0.05
+  lambda_base_rec: 1.0
+  lambda_base_ssim: 0.05
   lambda_wave_res: 0.1
   lambda_preview: 0.05
   lambda_flow: 0.02
   aux_loss_weights:
     pole_separation: !!float 1e-3
-    pole_dead_occupancy: !!float 1e-2
   energy_ema_decay: 0.99
   energy_floor: !!float 1e-4
   energy_weight_bounds: [0.25, 4.0]

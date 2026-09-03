@@ -1,4 +1,4 @@
-"""DAVIS 12-frame training dataset used by experiment 6220553."""
+"""DAVIS 12-frame training dataset used by NoRouter-K16."""
 
 import random
 from pathlib import Path

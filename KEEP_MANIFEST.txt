@@ -24,8 +24,8 @@ basicsr/utils/dist_util.py
 basicsr/utils/logger.py
 basicsr/utils/misc.py
 basicsr/utils/options.py
-options/isambard/train_AverNet_ModalContentPoleWaveletDWT3OfficialDense_numframe12_20k_cos150k.yml
-scripts/isambard/train_official_dense_4gpu_20k.sh
-scripts/isambard/validate_official_dense_reserved.sh
+options/isambard/train_AverNet_ModalContentPoleWaveletDWT3NoRouterK16_numframe12_20k_cos150k.yml
+scripts/isambard/train_norouter_k16_4gpu_20k.sh
+scripts/isambard/validate_norouter_k16_reserved.sh
 tests/check_official_dense_components.py
 tests/check_official_dense_propagation.py

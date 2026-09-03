@@ -1,4 +1,4 @@
-"""Cached whole-sequence DAVIS validation dataset for experiment 6220553."""
+"""Cached whole-sequence DAVIS validation dataset for NoRouter-K16."""
 
 from pathlib import Path
 

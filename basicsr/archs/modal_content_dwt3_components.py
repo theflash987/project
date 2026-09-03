@@ -28,20 +28,6 @@ def _restore_video(value, batch, frames):
         value.shape[3])
 
 
-class ZeroPreservingResidualUnit(nn.Module):
-    """Residual unit that maps an exact zero input to an exact zero output."""
-
-    def __init__(self, channels):
-        super().__init__()
-        self.body = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, 1, 1, bias=False),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(channels, channels, 3, 1, 1, bias=False))
-
-    def forward(self, value):
-        return value + self.body(value)
-
-
 class VideoPreContext(nn.Module):
     """Extract pre-restoration clip and frame degradation/content tokens."""
 
@@ -106,15 +92,10 @@ class VideoPreContext(nn.Module):
         pooled = spatial_context.mean(dim=(-2, -1)).transpose(1, 2)
         frame_tokens = self.temporal_mixer(pooled).transpose(1, 2)
         clip_token = self.clip_projection(frame_tokens.mean(dim=1))
-        summary_tokens = torch.cat([
-            clip_token.unsqueeze(1),
-            frame_tokens,
-        ], dim=1)
         return {
             'spatial': spatial_context,
             'frame_tokens': frame_tokens,
             'clip_token': clip_token,
-            'summary_tokens': summary_tokens,
         }
 
 
@@ -248,55 +229,6 @@ class Stage1PreviewHead(nn.Module):
         return lq + residual
 
 
-class InterStageDWTReanchor(nn.Module):
-    """Use signed multi-scale DWT demand to re-anchor Stage-2 residuals."""
-
-    def __init__(self, channels=96, detail_channels=9, demand_scale=1.0):
-        super().__init__()
-        self.demand_scale = float(demand_scale)
-        self.demand_encoder = nn.Sequential(
-            nn.Conv2d(
-                3 * detail_channels,
-                channels,
-                3,
-                1,
-                1,
-                bias=False),
-            nn.SiLU(inplace=True),
-            ZeroPreservingResidualUnit(channels))
-        self.residual = nn.Sequential(
-            nn.Conv2d(3 * channels, channels, 3, 1, 1),
-            nn.SiLU(inplace=True),
-            ResidualUnit(channels),
-            nn.Conv2d(channels, channels, 3, 1, 1))
-        nn.init.constant_(self.residual[-1].weight, 0.0)
-        nn.init.constant_(self.residual[-1].bias, 0.0)
-
-    @staticmethod
-    def _resize(detail, size):
-        if detail.shape[-2:] == size:
-            return detail
-        return F.interpolate(
-            detail,
-            size=size,
-            mode='bilinear',
-            align_corners=False)
-
-    def encode_demand(self, signed_details, feature_size):
-        demand = torch.cat([
-            self._resize(signed_details[level], feature_size)
-            for level in ('w3', 'w2', 'w1')
-        ], dim=1)
-        return self.demand_scale * self.demand_encoder(demand)
-
-    def forward(self, temporal_context, stage1_feature, demand_feature):
-        return self.residual(torch.cat([
-            temporal_context,
-            stage1_feature,
-            demand_feature,
-        ], dim=1))
-
-
 class FixedStablePoles(nn.Module):
     """Globally learned poles shared by every frame and video."""
 
@@ -392,169 +324,6 @@ class FixedStablePoles(nn.Module):
         return poles
 
 
-class ModalAttentionBlock(nn.Module):
-    """Cross-attend modes to video context, then mix modes with self-attention."""
-
-    def __init__(self, model_channels=64, num_heads=4, layer_scale_init=0.05):
-        super().__init__()
-        self.cross_norm = nn.LayerNorm(model_channels)
-        self.context_norm = nn.LayerNorm(model_channels)
-        self.cross_attention = nn.MultiheadAttention(
-            model_channels,
-            num_heads,
-            batch_first=True)
-        self.self_norm = nn.LayerNorm(model_channels)
-        self.self_attention = nn.MultiheadAttention(
-            model_channels,
-            num_heads,
-            batch_first=True)
-        self.ffn_norm = nn.LayerNorm(model_channels)
-        self.ffn = nn.Sequential(
-            nn.Linear(model_channels, 2 * model_channels),
-            nn.GELU(),
-            nn.Linear(2 * model_channels, model_channels))
-        initial = torch.full((3,), float(layer_scale_init))
-        self.layer_scale = nn.Parameter(initial)
-
-    def forward(self, modes, context):
-        cross, _ = self.cross_attention(
-            self.cross_norm(modes),
-            self.context_norm(context),
-            self.context_norm(context),
-            need_weights=False)
-        modes = modes + self.layer_scale[0] * cross
-        mixed, weights = self.self_attention(
-            self.self_norm(modes),
-            self.self_norm(modes),
-            self.self_norm(modes),
-            need_weights=True,
-            average_attn_weights=True)
-        modes = modes + self.layer_scale[1] * mixed
-        modes = modes + self.layer_scale[2] * self.ffn(
-            self.ffn_norm(modes))
-        return modes, weights
-
-
-class ModalResidueRefiner(nn.Module):
-    """Refine read-only real/imag pole residues using global modal attention."""
-
-    def __init__(
-            self,
-            num_poles=16,
-            state_channels=2,
-            context_channels=64,
-            model_channels=64,
-            num_heads=4,
-            num_blocks=1,
-            num_branches=4,
-            maximum_residue_scale=0.25,
-            maximum_gate_bias=2.0):
-        super().__init__()
-        self.num_poles = int(num_poles)
-        self.state_channels = int(state_channels)
-        self.maximum_residue_scale = float(maximum_residue_scale)
-        self.maximum_gate_bias = float(maximum_gate_bias)
-        self.state_projection = nn.Linear(state_channels, model_channels)
-        self.context_projection = nn.Linear(context_channels, model_channels)
-        self.coordinate_projection = nn.Sequential(
-            nn.Linear(2, model_channels),
-            nn.SiLU(inplace=True),
-            nn.Linear(model_channels, model_channels))
-        self.mode_embedding = nn.Embedding(num_poles, model_channels)
-        self.phase_embedding = nn.Embedding(2, model_channels)
-        self.branch_embedding = nn.Embedding(num_branches, model_channels)
-        self.blocks = nn.ModuleList([
-            ModalAttentionBlock(model_channels, num_heads)
-            for _ in range(num_blocks)
-        ])
-        self.residue_scale = nn.Linear(model_channels, state_channels)
-        self.read_gate_bias = nn.Linear(model_channels, 1)
-        nn.init.normal_(self.residue_scale.weight, mean=0.0, std=1e-3)
-        nn.init.constant_(self.residue_scale.bias, 0.0)
-        nn.init.normal_(self.read_gate_bias.weight, mean=0.0, std=1e-3)
-        nn.init.constant_(self.read_gate_bias.bias, 0.0)
-
-    def forward(
-            self,
-            history_real,
-            history_imag,
-            pole_coordinates,
-            summary_tokens,
-            branch_index):
-        batch, poles, channels, _, _ = history_real.shape
-        pooled_real = history_real.mean(dim=(-2, -1))
-        pooled_imag = history_imag.mean(dim=(-2, -1))
-        state_tokens = torch.cat([pooled_real, pooled_imag], dim=1)
-        tokens = self.state_projection(state_tokens)
-
-        mode_indices = torch.arange(
-            self.num_poles,
-            device=history_real.device)
-        mode_indices = torch.cat([mode_indices, mode_indices], dim=0)
-        phase_indices = torch.cat([
-            torch.zeros(
-                self.num_poles,
-                dtype=torch.long,
-                device=history_real.device),
-            torch.ones(
-                self.num_poles,
-                dtype=torch.long,
-                device=history_real.device),
-        ], dim=0)
-        coordinates = torch.cat([
-            pole_coordinates,
-            pole_coordinates,
-        ], dim=1)
-        branch_indices = torch.full(
-            (batch, 2 * self.num_poles),
-            int(branch_index),
-            dtype=torch.long,
-            device=history_real.device)
-        tokens = (
-            tokens
-            + self.coordinate_projection(coordinates)
-            + self.mode_embedding(mode_indices).unsqueeze(0)
-            + self.phase_embedding(phase_indices).unsqueeze(0)
-            + self.branch_embedding(branch_indices))
-        context = self.context_projection(summary_tokens)
-        self_weights = None
-        for block in self.blocks:
-            tokens, self_weights = block(tokens, context)
-
-        residue_scale = self.maximum_residue_scale * torch.tanh(
-            self.residue_scale(tokens))
-        real_scale, imag_scale = torch.split(
-            residue_scale,
-            self.num_poles,
-            dim=1)
-        refined_real = history_real * (
-            1.0 + real_scale.unsqueeze(-1).unsqueeze(-1))
-        refined_imag = history_imag * (
-            1.0 + imag_scale.unsqueeze(-1).unsqueeze(-1))
-
-        gate_bias = self.read_gate_bias(tokens).squeeze(-1)
-        real_bias, imag_bias = torch.split(
-            gate_bias,
-            self.num_poles,
-            dim=1)
-        gate_bias = self.maximum_gate_bias * torch.tanh(
-            0.5 * (real_bias + imag_bias))
-        token_count = 2 * self.num_poles
-        diagonal = torch.diagonal(
-            self_weights,
-            dim1=-2,
-            dim2=-1).sum(dim=-1)
-        off_diagonal_mass = (
-            self_weights.sum(dim=(-2, -1)) - diagonal) / token_count
-        return {
-            'history_real': refined_real,
-            'history_imag': refined_imag,
-            'read_gate_bias': gate_bias,
-            'off_diagonal_mass': off_diagonal_mass.detach().mean(),
-            'residue_scale_abs_mean': residue_scale.detach().abs().mean(),
-        }
-
-
 class ModalContentPoleMixer(nn.Module):
     """Predict independent local mode gates with bounded video-token biases."""
 
@@ -566,7 +335,7 @@ class ModalContentPoleMixer(nn.Module):
             hidden_channels=32):
         super().__init__()
         self.num_poles = int(num_poles)
-        output_channels = 3 * self.num_poles + 2
+        output_channels = 2 * self.num_poles + 1
         self.net = nn.Sequential(
             nn.Conv2d(
                 4 * int(channels) + 2 * self.num_poles + 3,
@@ -588,13 +357,9 @@ class ModalContentPoleMixer(nn.Module):
         nn.init.constant_(self.token_bias[-1].bias, 0.0)
         read_bias = math.log(0.25 / 0.75)
         write_bias = math.log(0.25 / 0.75)
-        keep_bias = math.log(0.995 / 0.005)
         self.net[-1].bias.data[:self.num_poles] = read_bias
         self.net[-1].bias.data[
             self.num_poles:2 * self.num_poles] = write_bias
-        self.net[-1].bias.data[
-            2 * self.num_poles:3 * self.num_poles] = keep_bias
-        self.net[-1].bias.data[-2] = math.log(0.25 / 0.75)
         self.net[-1].bias.data[-1] = math.log(0.90 / 0.10)
 
     def forward(
@@ -619,22 +384,14 @@ class ModalContentPoleMixer(nn.Module):
         logits = (
             self.net(evidence)
             + self.token_bias(frame_token).unsqueeze(-1).unsqueeze(-1))
-        (
-            read_logits,
-            write_logits,
-            keep_logits,
-            strength_logit,
-            propagation_logit,
-        ) = torch.split(
+        read_logits, write_logits, alignment_logit = torch.split(
             logits,
-            [self.num_poles, self.num_poles, self.num_poles, 1, 1],
+            [self.num_poles, self.num_poles, 1],
             dim=1)
         return {
             'read_logits': read_logits,
             'write_gate': torch.sigmoid(write_logits),
-            'keep_gate': torch.sigmoid(keep_logits),
-            'history_strength': torch.sigmoid(strength_logit),
-            'propagation_logit': propagation_logit,
+            'alignment_logit': alignment_logit,
         }
 
 
@@ -651,9 +408,7 @@ class ModalContentPoleHistoryCell(nn.Module):
             decay_eps=1e-6,
             flow_alpha=0.01,
             flow_beta=0.5,
-            spatial_temperature=0.5,
-            scene_reset_threshold=0.05,
-            scene_reset_temperature=0.01):
+            spatial_temperature=0.5):
         super().__init__()
         self.num_poles = int(num_poles)
         self.state_channels = int(state_channels)
@@ -661,8 +416,6 @@ class ModalContentPoleHistoryCell(nn.Module):
         self.flow_alpha = float(flow_alpha)
         self.flow_beta = float(flow_beta)
         self.spatial_temperature = float(spatial_temperature)
-        self.scene_reset_threshold = float(scene_reset_threshold)
-        self.scene_reset_temperature = float(scene_reset_temperature)
         modal_channels = self.num_poles * self.state_channels
         self.input_proj = nn.Conv2d(
             3 * int(channels),
@@ -689,7 +442,6 @@ class ModalContentPoleHistoryCell(nn.Module):
             hidden_channels=mixer_channels)
         self.last_debug_stats = {}
         self.last_occupancy = None
-        self.last_router_state = None
 
     def _zero_state(self, reference):
         shape = (
@@ -764,11 +516,12 @@ class ModalContentPoleHistoryCell(nn.Module):
                     keepdim=True)
             spatial_reliability = torch.exp(
                 -spatial_square / self.spatial_temperature)
-            confidence = (
-                valid * flow_reliability * spatial_reliability).clamp_(
-                    0.0,
-                    1.0)
-        return confidence, (flow_reliability, spatial_reliability, valid)
+            geometry_support = (valid * flow_reliability).clamp_(0.0, 1.0)
+        return geometry_support, (
+            flow_reliability,
+            spatial_reliability,
+            valid,
+        )
 
     def forward(
             self,
@@ -779,17 +532,14 @@ class ModalContentPoleHistoryCell(nn.Module):
             flow,
             reverse_flow,
             poles,
-            frame_token,
-            summary_tokens,
-            modal_refiner,
-            branch_index):
+            frame_token):
         history_available = state is not None and flow is not None
         if history_available:
             warped_real, warped_imag = self._warp_state(state, flow)
         else:
             warped_real, warped_imag = self._zero_state(feat_current)
             spatial_aligned = feat_current
-        confidence, reliability_maps = self._reliability(
+        geometry_support, reliability_maps = self._reliability(
             feat_current,
             spatial_aligned,
             flow,
@@ -835,37 +585,15 @@ class ModalContentPoleHistoryCell(nn.Module):
 
         a_real = poles['a_real'].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
         a_imag = poles['a_imag'].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        valid = reliability_maps[2]
-        global_confidence = confidence.mean(
-            dim=(-2, -1),
-            keepdim=True)
-        scene_support = torch.sigmoid(
-            (
-                global_confidence
-                - self.scene_reset_threshold)
-            / self.scene_reset_temperature)
-        keep = (
-            valid.unsqueeze(1)
-            * scene_support.unsqueeze(1)
-            * mixer['keep_gate'].unsqueeze(2))
-        history_real = keep * (
+        support = geometry_support.unsqueeze(1)
+        history_real = support * (
             a_real * warped_real - a_imag * warped_imag)
-        history_imag = keep * (
+        history_imag = support * (
             a_imag * warped_real + a_real * warped_imag)
-
-        pole_coordinates = torch.stack([
-            torch.log(poles['lambdas'].clamp_min(self.decay_eps)),
-            poles['omegas'] / math.pi,
-        ], dim=-1)
-        modal = modal_refiner(
-            history_real,
-            history_imag,
-            pole_coordinates,
-            summary_tokens,
-            branch_index)
-        read_gate = torch.sigmoid(
-            mixer['read_logits']
-            + modal['read_gate_bias'].unsqueeze(-1).unsqueeze(-1))
+        read_gate = (
+            geometry_support
+            * torch.sigmoid(mixer['read_logits'])
+        ).unsqueeze(2)
         read_real = self.read_real.view(
             1,
             self.num_poles,
@@ -878,27 +606,19 @@ class ModalContentPoleHistoryCell(nn.Module):
             self.state_channels,
             1,
             1)
-        modal_read = (
-            read_real * modal['history_real']
-            - read_imag * modal['history_imag'])
+        pole_read = (
+            read_real * history_real
+            - read_imag * history_imag)
         memory_state = (
-            read_gate.unsqueeze(2) * modal_read).reshape(
+            read_gate * pole_read).reshape(
                 batch,
                 self.num_poles * self.state_channels,
                 height,
                 width)
         memory = self.output_proj(self.read_norm(memory_state))
-        memory = confidence * mixer['history_strength'] * memory
-
-        confidence_logit = torch.logit(
-            confidence.clamp(
-                self.decay_eps,
-                1.0 - self.decay_eps))
-        propagation_trust = (
-            reliability_maps[2]
-            * torch.sigmoid(
-                confidence_logit
-                + mixer['propagation_logit']))
+        alignment_gate = (
+            geometry_support
+            * torch.sigmoid(mixer['alignment_logit']))
 
         write_gate = mixer['write_gate'].unsqueeze(2)
         write_real = self.write_real.view(
@@ -936,8 +656,8 @@ class ModalContentPoleHistoryCell(nn.Module):
                 keepdim=True).clamp_min(self.decay_eps)
         ).clamp_max(2.0)
         self.last_occupancy = (
-            read_gate * normalized_amplitude).mean(dim=(-2, -1))
-        gate_summary = read_gate.mean(dim=(-2, -1))
+            read_gate.squeeze(2) * normalized_amplitude).mean(dim=(-2, -1))
+        gate_summary = read_gate.squeeze(2).mean(dim=(-2, -1))
         effective_modes = (
             gate_summary.sum(dim=1).square()
             / gate_summary.square().sum(dim=1).clamp_min(
@@ -952,35 +672,18 @@ class ModalContentPoleHistoryCell(nn.Module):
             'transition_abs_max': transition.detach().max(),
             'history_available': feat_current.new_tensor(
                 float(history_available)),
-            'confidence_mean': confidence.detach().mean(),
-            'scene_support_mean': scene_support.detach().mean(),
+            'geometry_support_mean': geometry_support.detach().mean(),
             'read_gate_mean': read_gate.detach().mean(),
             'effective_active_poles': effective_modes.detach().mean(),
             'write_gate_mean': mixer['write_gate'].detach().mean(),
-            'keep_gate_mean': mixer['keep_gate'].detach().mean(),
-            'history_strength_mean': (
-                mixer['history_strength'].detach().mean()),
-            'propagation_trust_mean': propagation_trust.detach().mean(),
+            'alignment_gate_mean': alignment_gate.detach().mean(),
             'state_amplitude_mean': state_amplitude.detach().mean(),
             'state_abs_mean': (
                 real.detach().abs().mean()
                 + imag.detach().abs().mean()) * 0.5,
             'memory_abs_mean': memory.detach().abs().mean(),
-            'modal_off_diagonal_mass': modal['off_diagonal_mass'],
-            'modal_residue_scale_abs_mean': (
-                modal['residue_scale_abs_mean']),
         }
-        # This compact readout is consumed only by the detached Stage-2
-        # wavelet router.  Keeping it here avoids reconstructing the recurrent
-        # decisions from debug reductions after propagation has finished.
-        self.last_router_state = {
-            'real': real,
-            'imag': imag,
-            'read_gate': read_gate,
-            'confidence': confidence,
-            'history_strength': mixer['history_strength'],
-        }
-        return memory, (real, imag), propagation_trust
+        return memory, (real, imag), alignment_gate
 
 
 class CompactPostDegradationContext(nn.Module):

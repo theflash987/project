@@ -1,4 +1,4 @@
-"""Architecture construction for experiment 6220553."""
+"""Architecture construction for the NoRouter-K16 experiment."""
 
 from .modal_content_pole_wavelet_dwt3_arch import (
     AverNetModalContentPoleWaveletDWT3OfficialDense,

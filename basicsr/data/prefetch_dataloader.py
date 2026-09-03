@@ -1,4 +1,4 @@
-"""Iterator wrapper used by the 6220553 training loop."""
+"""Iterator wrapper used by the NoRouter-K16 training loop."""
 
 
 class CPUPrefetcher:
