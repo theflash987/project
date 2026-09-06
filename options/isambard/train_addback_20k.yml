@@ -1,4 +1,4 @@
-name: AverNet_ModalContentPoleWaveletDWT3NoRouterK16_num_frame12_bs4_4gpu_20k_cos150k
+name: AverNet_6308179_TimePoleFusion_num_frame12_bs4_4gpu_20k_cos150k
 manual_seed: 0
 
 datasets:
@@ -47,9 +47,10 @@ network_g:
   wavelet_hidden_channels: 96
   w1_guide_channels: 32
   wavelet_infer_chunk: 4
+  pole_context_channels: 32
 
 path:
-  experiments_root: /scratch/b6bd/zhuodong26.b6bd/AverNet/experiments
+  experiments_root: /scratch/b6bd/zhuodong26.b6bd/AverNet_6308179_TimePoleFusion/experiments
 
 train:
   ema_decay: 0.999
@@ -69,8 +70,8 @@ train:
   gradient_clip_norm: 1.0
   lambda_rec: 1.0
   lambda_ssim: 0.05
-  lambda_base_rec: 1.0
-  lambda_base_ssim: 0.05
+  lambda_base_rec: 0.0
+  lambda_base_ssim: 0.0
   lambda_wave_res: 0.1
   lambda_preview: 0.05
   lambda_flow: 0.02

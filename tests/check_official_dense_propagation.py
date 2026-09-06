@@ -8,13 +8,18 @@ import torch
 
 from basicsr.archs import build_network
 from basicsr.utils.options import yaml_load
+from check_addback_contract import check_initialization, check_structure
 
 
 LEVELS = ('w3', 'w2', 'w1')
 WAVELET_PREFIXES = (
     'post_degradation_context.',
     'w1_local_guide.',
+    'local_guides.',
+    'pole_fusions.',
     'wavelet_experts.',
+    'time_pole_context.',
+    'direction_attention.stage_2.',
 )
 
 
@@ -36,7 +41,6 @@ def wavelet_loss(outputs):
 
 def total_loss(outputs, gt):
     result = (outputs['restored'] - gt).square().mean()
-    result = result + (outputs['base_restored'] - gt).square().mean()
     result = result + 0.05 * (
         outputs['stage1_preview'] - gt).square().mean()
     result = result + 0.1 * wavelet_loss(outputs)
@@ -172,27 +176,8 @@ def main():
     network = build_network(deepcopy(option['network_g'])).cuda().train()
     assert network.__class__.__name__ == (
         'AverNetModalContentPoleWaveletDWT3OfficialDense')
-    assert set(network.direction_attention) == {'stage_1'}
-    assert network.wavelet_experts['w3'].spatial_film is None
-    assert network.wavelet_experts['w2'].spatial_film is None
-    assert network.wavelet_experts['w1'].spatial_film is not None
-    forbidden = (
-        'pole_wavelet_router',
-        'direction_attention.stage_2',
-        'modal_refiner',
-        'inter_stage_reanchor',
-        'keep_gate',
-        'history_strength',
-        'propagation_logit',
-        'parent',
-        'gain',
-        'rho_delta',
-        'omega_delta',
-        'complex_w2',
-    )
-    assert not any(token in key.lower()
-                   for key in network.state_dict()
-                   for token in forbidden)
+    check_structure(network)
+    check_initialization(network, option)
     check_geometry_support(network)
     with torch.no_grad():
         odd_ref = torch.rand(1, 3, 120, 213, device='cuda')
@@ -208,6 +193,15 @@ def main():
         [parameter for parameter in network.parameters()
          if parameter.requires_grad],
         lr=1e-4)
+
+    base_inputs = []
+    original_refine = network._wavelet_refine
+
+    def capture_base(lqs, base_restored, gt=None):
+        base_inputs[:] = [base_restored]
+        return original_refine(lqs, base_restored, gt=gt)
+
+    network._wavelet_refine = capture_base
 
     finish = dependency_hooks(network, frames)
     outputs = network(lq, gt=gt)
@@ -227,11 +221,15 @@ def main():
     del outputs
 
     outputs = network(lq, gt=gt)
+    base_inputs[0].retain_grad()
     wavelet_loss(outputs).backward()
     check_wavelet_boundary(network)
+    assert base_inputs[0].grad is None
     assert norm(network.post_degradation_context.parameters()) > 0
     assert norm(network.w1_local_guide.parameters()) > 0
     assert norm(network.wavelet_experts.parameters()) > 0
+    assert norm(network.local_guides.parameters()) > 0
+    assert norm(network.pole_fusions.parameters()) > 0
     print('WAVELET_ONLY_GRADIENT_BOUNDARY_OK', flush=True)
     network.zero_grad(set_to_none=True)
     del outputs
@@ -247,7 +245,9 @@ def main():
     del outputs
 
     outputs = network(lq, gt=gt)
+    base_inputs[0].retain_grad()
     (outputs['restored'] - gt).square().mean().backward()
+    assert base_inputs[0].grad.abs().sum().item() > 0
     assert norm(network.backbone.parameters()) > 0
     assert norm(network.post_degradation_context.parameters()) > 0
     assert norm(network.w1_local_guide.parameters()) > 0

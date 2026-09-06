@@ -25,6 +25,9 @@ from basicsr.archs.modal_content_dwt3_components import (
     VideoPreContext,
 )
 from basicsr.archs.spynet_arch import SpyNet
+from basicsr.archs.addback_components import (
+    LocalPoleFusion, TimePoleConditioning, spatial_film,
+)
 
 
 def _pad_video_to_multiple(video, multiple):
@@ -248,7 +251,8 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             post_context_branch_channels,
             wavelet_hidden_channels,
             w1_guide_channels,
-            wavelet_infer_chunk):
+            wavelet_infer_chunk,
+            pole_context_channels):
         super().__init__()
         self.mid_channels = int(mid_channels)
         self.spynet = SpyNet(load_path=spynet_pretrained)
@@ -382,6 +386,28 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
         self.last_aux_losses = {}
         self.last_temporal_stats = {}
         self.last_wavelet_stats = {}
+        self._stage2_pole_states = {}
+        self._last_pole_context_frames = None
+        with torch.random.fork_rng(devices=[]):
+            self.time_pole_context = TimePoleConditioning(
+                state_channels=pole_state_channels,
+                context_channels=pole_context_channels)
+            self.direction_attention['stage_2'] = LocalBidirectionalAttention(
+                channels=mid_channels, hidden_channels=direction_attention_channels,
+                eps=direction_attention_eps)
+            for level in ('w3', 'w2'):
+                self.wavelet_experts[level].spatial_film = spatial_film(
+                    pole_context_channels, wavelet_hidden_channels)
+
+        with torch.random.fork_rng(devices=[]):
+            self.local_guides = nn.ModuleDict({
+                level: W1LocalGuide(post_context_channels, w1_guide_channels)
+                for level in ('w3', 'w2')
+            })
+            self.pole_fusions = nn.ModuleDict({
+                level: LocalPoleFusion(w1_guide_channels, pole_context_channels)
+                for level in ('w3', 'w2', 'w1')
+            })
 
     def compute_flow(self, lqs):
         batch, frames, channels, height, width = lqs.shape
@@ -432,6 +458,7 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             backward_trust,
             forward_trust):
         fused_features = []
+        direction_weights = []
         frame_stats = []
         attention = self.direction_attention[stage_key]
         for frame in range(len(reference_features)):
@@ -440,13 +467,14 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             forward = forward_features[frame]
             backward_reliability = backward_trust[frame]
             forward_reliability = forward_trust[frame]
-            output = attention(
-                reference,
-                backward,
-                forward,
-                backward_reliability,
-                forward_reliability)
+            inputs = (
+                reference, backward, forward,
+                backward_reliability, forward_reliability)
+            if stage_key == 'stage_2':
+                inputs = tuple(value.detach() for value in inputs)
+            output = attention(*inputs)
             weights = output['weights']
+            direction_weights.append(weights)
             frame_stats.append({
                 'current_weight_mean': weights[:, 0].detach().mean(),
                 'backward_weight_mean': weights[:, 1].detach().mean(),
@@ -465,6 +493,8 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             })
             fused_features.append(output['fused'])
         self._attention_debug_stats[stage_key] = self._mean_stats(frame_stats)
+        if stage_key == 'stage_2':
+            self._stage2_direction_weights = direction_weights
         return fused_features
 
     @staticmethod
@@ -509,6 +539,7 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
         state = None
         branch_features = []
         branch_trust = []
+        pole_states = []
         frame_stats = []
         frame_occupancies = []
         branch_index = self._BRANCHES.index(branch)
@@ -550,6 +581,8 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
             temporal_context = (
                 alignment_gate * deform_aligned
                 + torch.tanh(self.memory_fusion[branch]) * memory)
+            if branch.endswith('_2'):
+                pole_states.append(self.history_cells[branch].last_conditioning_state)
             stats = dict(self.history_cells[branch].last_debug_stats)
             stats.update({
                 'modal_alignment_abs_mean': (
@@ -573,6 +606,9 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
         if direction == 'backward':
             branch_features = branch_features[::-1]
             branch_trust = branch_trust[::-1]
+            pole_states = pole_states[::-1]
+        if branch.endswith('_2'):
+            self._stage2_pole_states[branch] = pole_states
         self._branch_debug_stats[branch] = self._mean_stats(frame_stats)
         self._branch_occupancies[branch] = torch.stack(
             frame_occupancies, dim=1).mean(dim=(0, 1))
@@ -587,6 +623,24 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
                 lqs[:, frame], spatial_feature, stage1_feature)
             previews.append(preview)
         return torch.stack(previews, dim=1)
+
+    def _combine_stage2_pole_states(self):
+        combined = []
+        for backward, forward, weights in zip(
+                self._stage2_pole_states['backward_2'],
+                self._stage2_pole_states['forward_2'],
+                self._stage2_direction_weights):
+            wb, wf = weights[:, 1:2], weights[:, 2:3]
+            combined.append({
+                'real': wb.unsqueeze(1) * backward['real']
+                        + wf.unsqueeze(1) * forward['real'],
+                'imag': wb.unsqueeze(1) * backward['imag']
+                        + wf.unsqueeze(1) * forward['imag'],
+                'reliability': wb * backward['reliability']
+                               + wf * forward['reliability'],
+            })
+        self._last_pole_context_frames = combined
+        self._stage2_pole_states = {}
 
     def _collect_temporal_stats(self, reference):
         averaged = self._mean_stats(list(self._branch_debug_stats.values()))
@@ -689,6 +743,11 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
                     features['spatial'],
                     stage1_features)
 
+        self._fuse_bidirectional_stage(
+            'stage_2', stage1_features,
+            branch_features['backward_2'], branch_features['forward_2'],
+            branch_trust['backward_2'], branch_trust['forward_2'])
+        self._combine_stage2_pole_states()
         self.last_aux_losses = dict(pole_sequence['aux_losses'])
         features.update(branch_features)
         restored = self.upsample(lqs, features)
@@ -750,14 +809,21 @@ class AverNetModalContentPoleWaveletDWT3OfficialDense(nn.Module):
                 base_anchor[level],
                 lq_pyramid[level],
                 degradation['contexts'][level])
-            spatial_context = None
-            if level == 'w1':
-                spatial_context = self.w1_local_guide(
-                    base_anchor[level],
-                    lq_pyramid[level],
-                    degradation['contexts'][level])
-                wavelet_stats['w1_local_guide_abs_mean'] = (
-                    spatial_context.detach().abs().mean())
+            guide_encoder = (
+                self.w1_local_guide if level == 'w1' else self.local_guides[level])
+            guide = guide_encoder(
+                base_anchor[level], lq_pyramid[level], degradation['contexts'][level])
+            pole_context = self.time_pole_context(
+                level, self._last_pole_context_frames[
+                    frame_start:frame_start + lqs.shape[1]], guide,
+                {name: self._last_pole_sequence[name][
+                    :, frame_start:frame_start + lqs.shape[1]].detach()
+                 for name in ('lambdas', 'omegas')})
+            spatial_context = self.pole_fusions[level](guide, pole_context)
+            wavelet_stats[f'{level}_pole_context_abs_mean'] = (
+                pole_context.detach().abs().mean())
+            wavelet_stats[f'{level}_local_guide_abs_mean'] = (
+                guide.detach().abs().mean())
             residual = self.wavelet_experts[level](
                 evidence,
                 frame_tokens,

@@ -31,7 +31,7 @@ def dict2str(value, indent=0):
 def parse_options(root_path):
     parser = argparse.ArgumentParser()
     parser.add_argument('-opt', required=True)
-    parser.add_argument('--force_yml', nargs='+', required=True)
+    parser.add_argument('--force_yml', nargs='+', default=[])
     args = parser.parse_args()
     opt = yaml_load(args.opt)
     init_dist(opt['dist_params']['backend'])

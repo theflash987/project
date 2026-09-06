@@ -385,11 +385,17 @@ class ModalContentPoleWaveletDWT3VideoModel(BaseModel):
                 'wavelet_experts.')))
         direction_grad_norm = self._gradient_norm(
             lambda name: 'direction_attention.stage_1.' in name)
+        addback_grad_norm = self._gradient_norm(
+            lambda name: name.startswith(("time_pole_context.","local_guides.","pole_fusions.","direction_attention.stage_2.","wavelet_experts.w3.spatial_film.","wavelet_experts.w2.spatial_film.",)))
+        for prefix in ["local_guides","pole_fusions","time_pole_context.time_encoding","time_pole_context.query","time_pole_context.key"]:
+            loss_dict[prefix.replace('.', '_') + '_grad_norm'] = self._gradient_norm(
+                lambda name: name.startswith(prefix + '.')).detach()
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.net_g.parameters(), self.gradient_clip_norm)
         self.optimizer_g.step()
         loss_dict.update({
             'grad_norm': grad_norm.detach(),
+            'addback_grad_norm': addback_grad_norm.detach(),
             'spynet_grad_norm': spynet_grad_norm.detach(),
             'wavelet_branch_grad_norm': wavelet_branch_grad_norm.detach(),
             'stage1_direction_grad_norm': direction_grad_norm.detach(),

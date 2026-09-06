@@ -683,6 +683,11 @@ class ModalContentPoleHistoryCell(nn.Module):
                 + imag.detach().abs().mean()) * 0.5,
             'memory_abs_mean': memory.detach().abs().mean(),
         }
+        self.last_conditioning_state = {
+            'real': real.detach(),
+            'imag': imag.detach(),
+            'reliability': read_gate.squeeze(2).detach(),
+        }
         return memory, (real, imag), alignment_gate
 
 

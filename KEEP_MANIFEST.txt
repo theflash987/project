@@ -4,6 +4,7 @@ requirements-isambard.txt
 basicsr/__init__.py
 basicsr/train.py
 basicsr/archs/__init__.py
+basicsr/archs/addback_components.py
 basicsr/archs/arch_util.py
 basicsr/archs/spynet_arch.py
 basicsr/archs/official_dense_components.py
@@ -24,8 +25,11 @@ basicsr/utils/dist_util.py
 basicsr/utils/logger.py
 basicsr/utils/misc.py
 basicsr/utils/options.py
-options/isambard/train_AverNet_ModalContentPoleWaveletDWT3NoRouterK16_numframe12_20k_cos150k.yml
-scripts/isambard/train_norouter_k16_4gpu_20k.sh
-scripts/isambard/validate_norouter_k16_reserved.sh
+options/isambard/train_addback_20k.yml
+scripts/isambard/train_addback_4gpu_20k.sh
+scripts/isambard/validate_addback_reserved.sh
+tests/check_addback_config.py
+tests/check_addback_contract.py
+tests/check_addback_checkpoint.py
 tests/check_official_dense_components.py
 tests/check_official_dense_propagation.py
