@@ -1,1 +1,3 @@
-"""Minimal runtime package for the NoRouter-K16 experiment."""
+"""Additive pole-conditioned video restoration."""
+
+__version__ = "0.1.0"

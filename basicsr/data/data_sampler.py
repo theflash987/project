@@ -1,29 +1,27 @@
+"""Deterministic distributed frame-index sampling."""
+
 import math
+
 import torch
-from torch.utils.data.sampler import Sampler
+from torch.utils.data import Sampler
 
 
 class EnlargedSampler(Sampler):
-    """Deterministic distributed sampler used by the 20k training loop."""
-
-    def __init__(self, dataset, num_replicas, rank, ratio):
+    def __init__(self, dataset, num_replicas=1, rank=0, ratio=1):
+        if not len(dataset) or ratio < 1 or not 0 <= rank < num_replicas:
+            raise ValueError("Invalid dataset size, enlargement ratio, or distributed rank.")
         self.dataset = dataset
         self.num_replicas = num_replicas
         self.rank = rank
         self.epoch = 0
-        self.num_samples = math.ceil(len(self.dataset) * ratio / self.num_replicas)
-        self.total_size = self.num_samples * self.num_replicas
+        self.num_samples = math.ceil(len(dataset) * ratio / num_replicas)
+        self.total_size = self.num_samples * num_replicas
 
     def __iter__(self):
-        g = torch.Generator()
-        g.manual_seed(self.epoch)
-        indices = torch.randperm(self.total_size, generator=g).tolist()
-
-        dataset_size = len(self.dataset)
-        indices = [v % dataset_size for v in indices]
-
-        indices = indices[self.rank:self.total_size:self.num_replicas]
-        return iter(indices)
+        generator = torch.Generator().manual_seed(self.epoch)
+        indices = torch.randperm(self.total_size, generator=generator).tolist()
+        indices = [index % len(self.dataset) for index in indices]
+        return iter(indices[self.rank : self.total_size : self.num_replicas])
 
     def __len__(self):
         return self.num_samples

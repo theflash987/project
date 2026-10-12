@@ -1,0 +1,56 @@
+seed: 0
+output: experiments/additive
+
+model:
+  spynet_pretrained: weights/spynet_sintel_final-3d2a1287.pth
+  # Other model arguments use the original 96-channel, 16-pole defaults.
+
+datasets:
+  train:
+    lq: data/train/LQ
+    gt: data/train/GT
+    metadata: data/train_meta_info.txt
+    frames: 12
+    crop_size: 256
+    batch_size: 4
+    workers: 4
+    enlarge_ratio: 1
+    filename_format: 05d
+    extension: jpg
+  val:
+    lq: data/test/LQ
+    gt: data/test/GT
+    metadata: data/test_meta_info.txt
+
+train:
+  total_iter: 300000
+  ema_decay: 0.999
+  optim_g:
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.999]
+  eta_min: !!float 1e-7
+  fix_flow: 5000
+  flow_lr_mul: 0.25
+  flow_teacher_schedule: [5001, 6000]
+  gradient_clip_norm: 1.0
+  lambda_rec: 1.0
+  lambda_ssim: 0.05
+  lambda_wave_res: 0.1
+  lambda_preview: 0.05
+  lambda_flow: 0.02
+  aux_loss_weights:
+    pole_separation: !!float 1e-3
+  energy_ema_decay: 0.99
+  energy_floor: !!float 1e-4
+  energy_weight_bounds: [0.25, 4.0]
+  charbonnier_eps: !!float 1e-6
+
+validation:
+  interval: 5000
+  cpu_offload: true
+
+logging:
+  interval: 100
+  save_interval: 2500
+

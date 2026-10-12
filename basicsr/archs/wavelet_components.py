@@ -2,8 +2,6 @@
 
 import torch
 from torch import nn
-from torch.nn import functional as F
-
 
 _BIOR44_ALPHA = -1.586134342059924
 _BIOR44_BETA = -0.052980118572961
@@ -55,9 +53,7 @@ def _dwt_height(value):
 
 
 def _idwt_height(low, high):
-    return _idwt_width(
-        low.transpose(-2, -1), high.transpose(-2, -1)
-    ).transpose(-2, -1)
+    return _idwt_width(low.transpose(-2, -1), high.transpose(-2, -1)).transpose(-2, -1)
 
 
 def _dwt2d(video):
@@ -67,8 +63,7 @@ def _dwt2d(video):
     ll, hl = _dwt_height(low_width)
     lh, hh = _dwt_height(high_width)
     coefficients = torch.cat([ll, lh, hl, hh], dim=1)
-    return coefficients.reshape(
-        batch, frames, 4 * channels, height // 2, width // 2)
+    return coefficients.reshape(batch, frames, 4 * channels, height // 2, width // 2)
 
 
 def _idwt2d(coefficients):
@@ -78,8 +73,7 @@ def _idwt2d(coefficients):
     low_width = _idwt_height(ll, hl)
     high_width = _idwt_height(lh, hh)
     restored = _idwt_width(low_width, high_width)
-    return restored.reshape(
-        batch, frames, channels // 4, 2 * height, 2 * width)
+    return restored.reshape(batch, frames, channels // 4, 2 * height, 2 * width)
 
 
 def _split_level(coefficients):
@@ -93,10 +87,10 @@ def dwt3_bior44(video):
     a2, w2 = _split_level(_dwt2d(a1))
     a3, w3 = _split_level(_dwt2d(a2))
     return {
-        'a3': a3,
-        'w3': w3,
-        'w2': w2,
-        'w1': w1,
+        "a3": a3,
+        "w3": w3,
+        "w2": w2,
+        "w1": w1,
     }
 
 
@@ -111,7 +105,8 @@ class ResidualUnit(nn.Module):
         self.body = nn.Sequential(
             nn.Conv2d(channels, channels, 3, 1, 1),
             nn.SiLU(inplace=True),
-            nn.Conv2d(channels, channels, 3, 1, 1))
+            nn.Conv2d(channels, channels, 3, 1, 1),
+        )
 
     def forward(self, value):
         return value + self.body(value)
@@ -126,52 +121,50 @@ class LocalBidirectionalAttention(nn.Module):
         self.current_score = nn.Sequential(
             nn.Conv2d(channels, hidden_channels, 3, 1, 1),
             nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_channels, 1, 1))
+            nn.Conv2d(hidden_channels, 1, 1),
+        )
         self.temporal_score = nn.Sequential(
             nn.Conv2d(3 * channels + 1, hidden_channels, 3, 1, 1),
             nn.SiLU(inplace=True),
             nn.Conv2d(hidden_channels, hidden_channels, 3, 1, 1),
             nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_channels, 1, 1))
-        nn.init.normal_(
-            self.current_score[-1].weight, mean=0.0, std=1e-3)
+            nn.Conv2d(hidden_channels, 1, 1),
+        )
+        nn.init.normal_(self.current_score[-1].weight, mean=0.0, std=1e-3)
         nn.init.constant_(self.current_score[-1].bias, 0.0)
-        nn.init.normal_(
-            self.temporal_score[-1].weight, mean=0.0, std=1e-3)
+        nn.init.normal_(self.temporal_score[-1].weight, mean=0.0, std=1e-3)
         nn.init.constant_(self.temporal_score[-1].bias, 0.0)
 
     def _temporal_logit(self, reference, candidate, reliability):
-        learned = self.temporal_score(torch.cat([
-            reference,
-            candidate,
-            (reference - candidate).abs(),
-            reliability,
-        ], dim=1))
+        learned = self.temporal_score(
+            torch.cat(
+                [
+                    reference,
+                    candidate,
+                    (reference - candidate).abs(),
+                    reliability,
+                ],
+                dim=1,
+            )
+        )
         logit = learned + torch.log(reliability.clamp(self.eps, 1.0))
         return torch.where(
-            reliability > 0,
-            logit,
-            torch.full_like(logit, torch.finfo(logit.dtype).min))
+            reliability > 0, logit, torch.full_like(logit, torch.finfo(logit.dtype).min)
+        )
 
-    def forward(
-            self,
-            reference,
-            backward,
-            forward,
-            backward_reliability,
-            forward_reliability):
-        logits = torch.cat([
-            self.current_score(reference),
-            self._temporal_logit(
-                reference, backward, backward_reliability),
-            self._temporal_logit(
-                reference, forward, forward_reliability),
-        ], dim=1)
+    def forward(self, reference, backward, forward, backward_reliability, forward_reliability):
+        logits = torch.cat(
+            [
+                self.current_score(reference),
+                self._temporal_logit(reference, backward, backward_reliability),
+                self._temporal_logit(reference, forward, forward_reliability),
+            ],
+            dim=1,
+        )
         weights = torch.softmax(logits, dim=1)
         return {
-            'fused': (
-                weights[:, 0:1] * reference
-                + weights[:, 1:2] * backward
-                + weights[:, 2:3] * forward),
-            'weights': weights,
+            "fused": (
+                weights[:, 0:1] * reference + weights[:, 1:2] * backward + weights[:, 2:3] * forward
+            ),
+            "weights": weights,
         }

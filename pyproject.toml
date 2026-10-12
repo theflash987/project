@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modal-content-pole-wavelet"
+version = "0.1.0"
+description = "Video restoration with stable pole memory and additive wavelet conditioning"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "torch==2.6.0",
+  "numpy>=1.24,<2",
+  "opencv-python-headless>=4.8,<4.12",
+  "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+ops = ["mmcv==2.2.0"]
+metrics = ["pyiqa==0.1.15.post2"]
+dev = ["ruff>=0.6", "build>=1.2"]
+
+[tool.setuptools.packages.find]
+include = ["basicsr*"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+
