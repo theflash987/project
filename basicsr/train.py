@@ -30,6 +30,21 @@ def seed_all(seed):
     torch.cuda.manual_seed_all(seed)
 
 
+def prepare_output_directory(config, resume):
+    """Create output on rank zero before workers open their log files."""
+    output = Path(config["output"])
+    if rank_and_size()[0] == 0:
+        if resume is None and output.exists() and any(output.iterdir()):
+            raise ValueError(
+                f"Output directory is not empty: {output}; choose a new directory or --resume."
+            )
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "config.yml").write_text(yaml.safe_dump(config, sort_keys=False))
+    if is_distributed():
+        torch.distributed.barrier()
+    return output
+
+
 def train(config, resume=None):
     from basicsr.models.modal_content_pole_wavelet_dwt3_video_model import Trainer
 
@@ -37,16 +52,7 @@ def train(config, resume=None):
     rank, world_size = rank_and_size()
     seed_all(config["seed"] + rank)
     torch.backends.cudnn.benchmark = True
-    output = Path(config["output"])
-    if resume is None and output.exists() and any(output.iterdir()):
-        raise ValueError(
-            f"Output directory is not empty: {output}; choose a new directory or --resume."
-        )
-    if rank == 0:
-        output.mkdir(parents=True, exist_ok=True)
-        (output / "config.yml").write_text(yaml.safe_dump(config, sort_keys=False))
-    if is_distributed():
-        torch.distributed.barrier()
+    output = prepare_output_directory(config, resume)
     logging.basicConfig(
         level=logging.INFO if rank == 0 else logging.WARNING,
         format="%(asctime)s %(message)s",
@@ -137,7 +143,7 @@ def main():
     ):
         if config[section][key] < 1:
             raise ValueError(f"{section}.{key} must be positive.")
-    if not config["model"].get("spynet_pretrained"):
+    if not config["model"]["spynet_pretrained"]:
         raise ValueError("Training requires a pretrained SpyNet checkpoint.")
     try:
         train(config, args.resume)

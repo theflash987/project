@@ -18,9 +18,7 @@ def main():
     )
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument(
-        "--config", type=Path, help="Optional training YAML for nondefault model dimensions"
-    )
+    parser.add_argument("--config", required=True, type=Path, help="Model training YAML")
     parser.add_argument("--param-key", choices=("params", "params_ema"), default="params_ema")
     parser.add_argument("--cpu-offload", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
@@ -30,7 +28,7 @@ def main():
         raise RuntimeError("Inference requires CUDA and MMCV with compiled operators.")
     if args.output.exists() and any(args.output.iterdir()):
         raise ValueError("Choose an empty output folder.")
-    options = yaml.safe_load(args.config.read_text())["model"] if args.config else {}
+    options = yaml.safe_load(args.config.read_text())["model"]
     options = {**options, "spynet_pretrained": None}
     model = ModalContentPoleWaveletDWT3(**options).cuda().eval()
     load_generator(model, args.checkpoint, args.param_key)

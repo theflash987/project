@@ -13,7 +13,6 @@ from basicsr.archs.inference_frame_cache import CpuFrameCache
 from basicsr.archs.pole_conditioning import (
     AdditivePoleConditioning,
     LocalPoleFusion,
-    PreviewConditioning,
     spatial_film,
 )
 from basicsr.archs.spynet_arch import SpyNet
@@ -410,7 +409,18 @@ class ModalContentPoleWaveletDWT3(nn.Module):
             )
 
         with torch.random.fork_rng(devices=[]):
-            self.preview_condition = PreviewConditioning(w1_guide_channels)
+            self.preview_feat_extract = nn.Sequential(
+                nn.Conv2d(6, self.mid_channels, 3, 2, 1),
+                nn.LeakyReLU(negative_slope=0.1, inplace=True),
+                nn.Conv2d(self.mid_channels, self.mid_channels, 3, 2, 1),
+                nn.LeakyReLU(negative_slope=0.1, inplace=True),
+                ResidualBlocksWithInputConv(self.mid_channels, self.mid_channels, 5),
+            )
+            self.preview_stage2_projection = nn.Conv2d(
+                self.mid_channels, self.mid_channels, 1
+            )
+            nn.init.normal_(self.preview_stage2_projection.weight, std=1e-3)
+            nn.init.zeros_(self.preview_stage2_projection.bias)
 
     @property
     def _offload_inference(self):
@@ -630,6 +640,27 @@ class ModalContentPoleWaveletDWT3(nn.Module):
         if self._offload_inference:
             self._stage2_direction_weights = None
 
+    def _build_stage2_spatial(self, lqs, stage1_features):
+        """Retain F1 and inject live preview evidence before both second passes."""
+        batch, frames, _, height, width = lqs.shape
+        if self.training:
+            evidence = torch.cat([lqs, self._last_stage1_preview], dim=2)
+            guidance = self.preview_stage2_projection(
+                self.preview_feat_extract(evidence.reshape(batch * frames, 6, height, width))
+            ).reshape(batch, frames, self.mid_channels, height // 4, width // 4)
+            return [feature + guidance[:, frame] for frame, feature in enumerate(stage1_features)]
+
+        # Framewise evaluation keeps full-video inference from duplicating RGB storage.
+        result = CpuFrameCache(lqs.device) if self._offload_inference else []
+        for frame, feature in enumerate(stage1_features):
+            preview = self._last_stage1_preview[:, frame].to(
+                device=lqs.device, dtype=lqs.dtype
+            )
+            evidence = torch.cat([lqs[:, frame], preview], dim=1)
+            guidance = self.preview_stage2_projection(self.preview_feat_extract(evidence))
+            result.append(feature + guidance)
+        return result
+
     def prompt_free_backbone(self, lqs):
         batch, frames, channels, height, width = lqs.shape
         lqs_downsample = F.interpolate(
@@ -667,11 +698,12 @@ class ModalContentPoleWaveletDWT3(nn.Module):
 
         branch_features = {}
         branch_trust = {}
+        stage2_spatial = None
         for stage_index, stage_branches in enumerate(self._STAGE_BRANCHES, start=1):
             for branch in stage_branches:
                 branch_features[branch], branch_trust[branch] = self._propagate_branch(
                     branch,
-                    features["spatial"],
+                    features["spatial"] if stage_index == 1 else stage2_spatial,
                     branch_features,
                     modal_alignment,
                     flows_forward,
@@ -692,6 +724,7 @@ class ModalContentPoleWaveletDWT3(nn.Module):
                 self._last_stage1_preview = self._build_stage1_preview(
                     lqs, features["spatial"], stage1_features
                 )
+                stage2_spatial = self._build_stage2_spatial(lqs, stage1_features)
 
         self._fuse_bidirectional_stage(
             "stage_2",
@@ -704,7 +737,7 @@ class ModalContentPoleWaveletDWT3(nn.Module):
         self._combine_stage2_pole_states()
         self.last_aux_losses = dict(pole_sequence["aux_losses"])
         if self._offload_inference:
-            del stage1_features, modal_alignment, branch_trust
+            del stage1_features, stage2_spatial, modal_alignment, branch_trust
         features.update(branch_features)
         restored = self.upsample(lqs, features)
         return restored
@@ -737,10 +770,6 @@ class ModalContentPoleWaveletDWT3(nn.Module):
     def _wavelet_refine_chunk(self, lqs, base_restored, gt=None, frame_start=0):
         lq_pyramid = dwt3_bior44(lqs)
         base_live = dwt3_bior44(base_restored)
-        preview = self._last_stage1_preview[:, frame_start : frame_start + lqs.shape[1]]
-        # CPU storage preserves the full preview; only this halo interval is needed.
-        preview = preview.to(device=lqs.device, dtype=lqs.dtype)
-        preview_pyramid = dwt3_bior44(preview)
         base_anchor = {name: value.detach() for name, value in base_live.items()}
         spatial_sizes = {level: base_live[level].shape[-2:] for level in ("w3", "w2", "w1")}
         flows_forward, flows_backward = self._flows_for_chunk(frame_start, lqs.shape[1])
@@ -765,10 +794,6 @@ class ModalContentPoleWaveletDWT3(nn.Module):
             guide = guide_encoder(
                 base_anchor[level], lq_pyramid[level], degradation["contexts"][level]
             )
-            preview_context = self.preview_condition(
-                level, preview_pyramid[level], lq_pyramid[level]
-            )
-            guide = guide + preview_context
             pole_context = self.time_pole_context(
                 level,
                 self._last_pole_context_frames[frame_start : frame_start + lqs.shape[1]],

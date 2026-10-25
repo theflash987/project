@@ -38,7 +38,6 @@ class Trainer:
             "lambda_rec",
             "lambda_ssim",
             "lambda_wave_res",
-            "lambda_preview",
             "lambda_flow",
             "energy_ema_decay",
             "energy_floor",
@@ -259,7 +258,6 @@ class Trainer:
         losses = OrderedDict(
             l_final_rec=self._charbonnier(self.output, self.gt),
             l_final_ssim=self._ssim_loss(self.output, self.gt),
-            l_preview=self._charbonnier(outputs["stage1_preview"], self.gt),
         )
         energy_ema = self._update_energy_ema(outputs)
         losses["l_wave_res"], _ = self._wavelet_residual_loss(outputs, energy_ema)
@@ -273,7 +271,6 @@ class Trainer:
             self.lambda_rec * losses["l_final_rec"]
             + self.lambda_ssim * losses["l_final_ssim"]
             + self.lambda_wave_res * losses["l_wave_res"]
-            + self.lambda_preview * losses["l_preview"]
             + flow_weight * flow_loss
         )
         for name, value in outputs["aux_losses"].items():

@@ -44,12 +44,12 @@ class ModelTests(unittest.TestCase):
         video = torch.rand(1, 2, 3, 256, 256, device="cuda")
         outputs = model(video, gt=video)
         loss = (outputs["restored"] - video).square().mean()
-        loss = loss + 0.05 * (outputs["stage1_preview"] - video).square().mean()
         loss = loss + 1e-3 * outputs["aux_losses"]["pole_separation"]
         loss.backward()
         groups = (
             "time_pole_context.mixing_mlp",
-            "preview_condition",
+            "preview_feat_extract",
+            "preview_stage2_projection",
             "stage1_preview",
             "direction_attention.stage_2",
             "history_cells.backward_2",

@@ -1,15 +1,19 @@
+# Run commands from the repository root; paths below are relative to that directory.
 seed: 0
-output: experiments/additive
+output: experiments/preview_guided_stage2_v3
 
 model:
+  # Place the pretrained SPyNet Sintel checkpoint here, or set your own weight path.
+  # Full-model inference restores SPyNet from the model checkpoint instead.
   spynet_pretrained: weights/spynet_sintel_final-3d2a1287.pth
-  # Other model arguments use the original 96-channel, 16-pole defaults.
+  num_poles: 8
 
 datasets:
+  # Set these paths to your v3 dataset folders and metadata files.
   train:
-    lq: data/train/LQ
-    gt: data/train/GT
-    metadata: data/train_meta_info.txt
+    lq: data/AdverseWeather_SmoothTVD_v3/train/LQ
+    gt: data/AdverseWeather_SmoothTVD_v3/train/GT
+    metadata: data/AdverseWeather_SmoothTVD_v3/train_meta_info.txt
     frames: 12
     crop_size: 256
     batch_size: 4
@@ -18,18 +22,18 @@ datasets:
     filename_format: 05d
     extension: jpg
   val:
-    lq: data/test/LQ
-    gt: data/test/GT
-    metadata: data/test_meta_info.txt
+    lq: data/AdverseWeather_SmoothTVD_v3/test/LQ
+    gt: data/AdverseWeather_SmoothTVD_v3/test/GT
+    metadata: data/AdverseWeather_SmoothTVD_v3/test_meta_info.txt
 
 train:
-  total_iter: 300000
+  total_iter: 150000
   ema_decay: 0.999
   optim_g:
-    lr: !!float 1e-4
+    lr: 0.0001
     weight_decay: 0
     betas: [0.9, 0.999]
-  eta_min: !!float 1e-7
+  eta_min: 1.0e-07
   fix_flow: 5000
   flow_lr_mul: 0.25
   flow_teacher_schedule: [5001, 6000]
@@ -37,14 +41,13 @@ train:
   lambda_rec: 1.0
   lambda_ssim: 0.05
   lambda_wave_res: 0.1
-  lambda_preview: 0.05
   lambda_flow: 0.02
   aux_loss_weights:
-    pole_separation: !!float 1e-3
+    pole_separation: 0.001
   energy_ema_decay: 0.99
-  energy_floor: !!float 1e-4
+  energy_floor: 0.0001
   energy_weight_bounds: [0.25, 4.0]
-  charbonnier_eps: !!float 1e-6
+  charbonnier_eps: 1.0e-06
 
 validation:
   interval: 5000
@@ -53,4 +56,3 @@ validation:
 logging:
   interval: 100
   save_interval: 2500
-
